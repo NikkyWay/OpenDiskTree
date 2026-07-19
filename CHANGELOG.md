@@ -11,6 +11,7 @@ All notable changes to OpenDiskTree are recorded here.
 - Reworked the main window so the table and treemap use all available height, live scans do not show stale directory data, and in-progress folder sizes are clearly marked as calculating.
 - Added visible elapsed time, item rate, current path, pause and stop controls during scans.
 - Rebuilt the filter popover with unclipped labels, grouped controls, active-filter count and a scrollable fixed-size layout.
+- Added a prominent latest-DMG download button to the README and stable release artifact names for permanent download links.
 
 ## 1.0.1 — 2026-07-19
 

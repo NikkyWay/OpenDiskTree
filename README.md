@@ -4,6 +4,10 @@ OpenDiskTree is a native disk-space explorer for Apple Silicon Macs. It answers 
 
 The app combines a directory outline, sortable file table and treemap. Known data receives an explainable safety label; everything else remains **Review**. Complete scans can be exported as JSON, CSV or SQLite, while the smaller AI report keeps only useful summaries and can pseudonymize private path segments.
 
+[![Download the latest DMG](https://img.shields.io/badge/Download-latest_DMG-0A84FF?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/NikkyWay/OpenDiskTree/releases/latest/download/OpenDiskTree-arm64.dmg)
+
+[View all releases](https://github.com/NikkyWay/OpenDiskTree/releases) · Apple Silicon · macOS 14+
+
 ![OpenDiskTree showing a scanned Swift project](Docs/Images/main-window.jpg)
 
 ## Highlights
@@ -40,10 +44,10 @@ open dist/OpenDiskTree.app
 `build-app.sh` creates an ad-hoc signed application. Release ZIP, DMG and SHA-256 manifest are built with:
 
 ```sh
-./Scripts/release.sh 1.0.1
+./Scripts/release.sh 1.0.2
 ```
 
-GitHub release artifacts are unsigned. On first launch, macOS may require **Control-click → Open**. Developer ID signing and notarization can be added later without changing the application targets.
+The command creates `OpenDiskTree-arm64.dmg`, `OpenDiskTree-arm64.zip` and `SHA256SUMS.txt`. GitHub release artifacts are unsigned. On first launch, macOS may require **Control-click → Open**. Developer ID signing and notarization can be added later without changing the application targets.
 
 ## First scan
 

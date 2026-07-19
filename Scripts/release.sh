@@ -6,9 +6,9 @@ cd "$ROOT_DIR"
 "$ROOT_DIR/Scripts/build-app.sh"
 
 VERSION=${1:-dev}
-ARCHIVE="$ROOT_DIR/dist/OpenDiskTree-$VERSION-arm64.zip"
-DISK_IMAGE="$ROOT_DIR/dist/OpenDiskTree-$VERSION-arm64.dmg"
-CHECKSUMS="$ROOT_DIR/dist/OpenDiskTree-$VERSION-SHA256SUMS.txt"
+ARCHIVE="$ROOT_DIR/dist/OpenDiskTree-arm64.zip"
+DISK_IMAGE="$ROOT_DIR/dist/OpenDiskTree-arm64.dmg"
+CHECKSUMS="$ROOT_DIR/dist/SHA256SUMS.txt"
 
 rm -f "$ARCHIVE" "$DISK_IMAGE" "$CHECKSUMS"
 ditto -c -k --sequesterRsrc --keepParent "$ROOT_DIR/dist/OpenDiskTree.app" "$ARCHIVE"
