@@ -16,7 +16,7 @@ jobs:
         run: swift test
       - name: Package
         run: ./Scripts/release.sh "${GITHUB_REF_NAME}"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.zip
