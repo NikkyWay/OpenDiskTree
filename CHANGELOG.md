@@ -7,7 +7,10 @@ All notable changes to OpenDiskTree are recorded here.
 - Read names, sizes, timestamps, file identity and link counts in the same native metadata batch instead of issuing a separate `stat` call for every item.
 - Stop full-disk scans at nested mounted volumes, including iOS Simulator runtimes, while keeping those mount points visible in results.
 - Increased SQLite insert batches and removed per-item URL construction from the scanner hot path.
-- Cancelled snapshots now retain their live byte totals.
+- Cancelled snapshots now retain their live byte totals and are identified as partial after relaunch.
+- Reworked the main window so the table and treemap use all available height, live scans do not show stale directory data, and in-progress folder sizes are clearly marked as calculating.
+- Added visible elapsed time, item rate, current path, pause and stop controls during scans.
+- Rebuilt the filter popover with unclipped labels, grouped controls, active-filter count and a scrollable fixed-size layout.
 
 ## 1.0.1 — 2026-07-19
 

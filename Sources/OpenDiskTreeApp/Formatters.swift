@@ -6,6 +6,16 @@ enum HumanFormat {
   static func size(_ value: UInt64) -> String {
     ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .file)
   }
+
+  static func duration(_ interval: TimeInterval) -> String {
+    let seconds = max(0, Int(interval))
+    let hours = seconds / 3_600
+    let minutes = (seconds % 3_600) / 60
+    let remainder = seconds % 60
+    return hours > 0
+      ? String(format: "%d:%02d:%02d", hours, minutes, remainder)
+      : String(format: "%d:%02d", minutes, remainder)
+  }
 }
 
 extension SafetyStatus {

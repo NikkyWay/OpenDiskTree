@@ -4,7 +4,6 @@ import SwiftUI
 struct ContentView: View {
   @ObservedObject var model: AppModel
   @State private var privacy = PrivacyMode.basic
-  @State private var tableHeight: CGFloat = 330
   @State private var showFilters = false
 
   var body: some View {
@@ -75,6 +74,27 @@ struct ContentView: View {
             if let scan = model.recentScans.first(where: { $0.id == id }) { model.selectScan(scan) }
           })
       ) {
+        if model.isScanning {
+          Section("Scanning") {
+            VStack(alignment: .leading, spacing: 7) {
+              HStack {
+                ProgressView().controlSize(.small)
+                Text(model.isPaused ? "Paused" : "Reading disk…").fontWeight(.medium)
+              }
+              Text(model.currentScan?.rootPath ?? model.progress.currentPath)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+              Text(
+                "\((model.progress.files + model.progress.directories).formatted()) items found"
+              )
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+          }
+        }
         Section("History") {
           ForEach(model.recentScans) { scan in
             VStack(alignment: .leading, spacing: 2) {
@@ -97,54 +117,112 @@ struct ContentView: View {
         }
       }
       Divider()
-      VStack(spacing: 8) {
+      VStack(spacing: 9) {
         Button(action: model.chooseFolder) {
           Label(String(localized: "scan.folder"), systemImage: "folder.badge.plus")
-        }.buttonStyle(.borderedProminent)
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(model.isScanning)
         Button(action: model.scanFullDisk) {
           Label(String(localized: "scan.disk"), systemImage: "internaldrive")
+            .frame(maxWidth: .infinity)
         }
-        Button("Full Disk Access…", action: model.openFullDiskAccessSettings).font(.caption)
-      }.padding()
+        .buttonStyle(.bordered)
+        .disabled(model.isScanning)
+        Button("Full Disk Access…", action: model.openFullDiskAccessSettings)
+          .font(.caption)
+        Text("OpenDiskTree \(appVersion)")
+          .font(.caption2)
+          .foregroundStyle(.tertiary)
+      }
+      .padding()
     }
   }
 
   private var toolbar: some View {
-    HStack(spacing: 10) {
-      if model.currentScan != nil && model.currentParentID != 1 {
-        Button(action: model.navigateBack) { Image(systemName: "chevron.left") }.help("Back")
-      }
-      Text(model.navigationStack.last?.path ?? model.currentScan?.rootPath ?? "OpenDiskTree")
-        .font(.headline).lineLimit(1).truncationMode(.middle)
-      Spacer()
-      TextField("Search name or path", text: $model.searchText)
-        .textFieldStyle(.roundedBorder).frame(width: 240)
-        .onSubmit(model.applyFilter)
-      Button {
-        showFilters.toggle()
-      } label: {
-        Label("Filters", systemImage: "line.3.horizontal.decrease.circle")
-      }
-      .popover(isPresented: $showFilters, arrowEdge: .bottom) {
-        FilterPanel(model: model).frame(width: 330).padding()
-      }
-      Picker("Sort", selection: $model.sort) {
-        Text("On disk").tag(ItemSort.allocatedSize)
-        Text("Logical").tag(ItemSort.logicalSize)
-      }.frame(width: 110).onChange(of: model.sort) { _, _ in model.applyFilter() }
-      if model.isScanning {
-        Button(action: model.togglePause) {
-          Image(systemName: model.isPaused ? "play.fill" : "pause.fill")
+    VStack(spacing: 9) {
+      HStack(spacing: 10) {
+        if model.currentScan != nil && model.currentParentID != 1 {
+          Button(action: model.navigateBack) { Image(systemName: "chevron.left") }
+            .help("Back")
         }
-        Button(role: .destructive, action: model.cancelScan) { Image(systemName: "xmark") }
-      } else {
-        Button(action: model.findDuplicates) {
-          Label("Duplicates", systemImage: "square.on.square")
+        Image(systemName: "folder")
+          .foregroundStyle(.secondary)
+        Text(model.navigationStack.last?.path ?? model.currentScan?.rootPath ?? "OpenDiskTree")
+          .font(.headline)
+          .lineLimit(1)
+          .truncationMode(.middle)
+        if model.isScanning {
+          Label(
+            model.isPaused ? "Paused" : "Scanning",
+            systemImage: model.isPaused ? "pause.fill" : "waveform.path"
+          )
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(model.isPaused ? .orange : .blue)
+          .padding(.horizontal, 8)
+          .padding(.vertical, 4)
+          .background((model.isPaused ? Color.orange : Color.blue).opacity(0.12))
+          .clipShape(Capsule())
         }
-        .disabled(model.currentScan == nil || model.isFindingDuplicates)
+        Spacer(minLength: 12)
+        if model.isScanning {
+          Button(action: model.togglePause) {
+            Label(
+              String(localized: model.isPaused ? "scan.resume" : "scan.pause"),
+              systemImage: model.isPaused ? "play.fill" : "pause.fill")
+          }
+          Button(role: .destructive, action: model.cancelScan) {
+            Label(String(localized: "scan.cancel"), systemImage: "stop.fill")
+          }
+        } else {
+          Button(action: model.findDuplicates) {
+            Label("Duplicates", systemImage: "square.on.square")
+          }
+          .disabled(model.currentScan == nil || model.isFindingDuplicates)
+          exportMenu
+        }
       }
-      exportMenu
-    }.padding(10)
+      HStack(spacing: 10) {
+        TextField("Search name or path", text: $model.searchText)
+          .textFieldStyle(.roundedBorder)
+          .frame(minWidth: 260, maxWidth: 520)
+          .onSubmit(model.applyFilter)
+        Button {
+          showFilters.toggle()
+        } label: {
+          HStack(spacing: 6) {
+            Label("Filters", systemImage: "line.3.horizontal.decrease.circle")
+            if model.activeFilterCount > 0 {
+              Text(model.activeFilterCount.formatted())
+                .font(.caption2.weight(.bold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.accentColor)
+                .foregroundStyle(.white)
+                .clipShape(Capsule())
+            }
+          }
+        }
+        .popover(isPresented: $showFilters, arrowEdge: .bottom) {
+          FilterPanel(model: model)
+        }
+        Spacer()
+        Text("Size")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Picker("Sort", selection: $model.sort) {
+          Text("On disk").tag(ItemSort.allocatedSize)
+          Text("Logical").tag(ItemSort.logicalSize)
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .frame(width: 190)
+        .onChange(of: model.sort) { _, _ in model.applyFilter() }
+      }
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 10)
   }
 
   private var exportMenu: some View {
@@ -180,51 +258,115 @@ struct ContentView: View {
     HSplitView {
       DirectoryOutlineView(
         items: model.directoryItems, selectedID: model.currentParentID,
+        isScanning: model.isScanning,
         onSelect: model.navigateFromTree
       )
-      .frame(minWidth: 190, idealWidth: 240, maxWidth: 360)
+      .frame(minWidth: 150, idealWidth: 185, maxWidth: 235, maxHeight: .infinity)
       VSplitView {
         ResultsTableView(
           items: model.items,
           selectedID: model.selectedItem?.id,
+          isScanning: model.isScanning,
           onSelect: model.selectItem,
           onOpen: { $0.kind.canHaveChildren ? model.navigate(into: $0) : model.reveal($0) },
           onReveal: model.reveal,
           onTrash: model.requestTrash
-        ).frame(minHeight: 240, idealHeight: tableHeight)
+        )
+        .frame(minWidth: 400, minHeight: 260, idealHeight: 390, maxHeight: .infinity)
         TreemapView(
           items: model.items,
           selectedID: model.selectedItem?.id,
+          isScanning: model.isScanning,
           onSelect: model.selectItem,
           onOpen: { $0.kind.canHaveChildren ? model.navigate(into: $0) : model.reveal($0) }
-        ).frame(minHeight: 180).padding(8)
+        )
+        .frame(minHeight: 180, idealHeight: 240, maxHeight: .infinity)
+        .padding(8)
       }
+      .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
       InspectorView(
         item: model.selectedItem, onReveal: model.reveal, onTrash: model.requestTrash,
-        onOpenSourceApp: model.openSourceApplication)
+        onOpenSourceApp: model.openSourceApplication
+      )
+      .frame(minWidth: 220, idealWidth: 245, maxWidth: 285, maxHeight: .infinity)
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  @ViewBuilder
+  private var statusBar: some View {
+    if model.isScanning {
+      TimelineView(.periodic(from: .now, by: 1)) { context in
+        let elapsed = max(1, context.date.timeIntervalSince(model.progress.startedAt))
+        let itemCount = model.progress.files + model.progress.directories
+        let itemsPerSecond = Int64(Double(itemCount) / elapsed)
+        VStack(spacing: 3) {
+          HStack(spacing: 14) {
+            if model.isPaused {
+              Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+            } else {
+              ProgressView().controlSize(.small)
+            }
+            Label("\(model.progress.files.formatted()) files", systemImage: "doc")
+            Label("\(model.progress.directories.formatted()) folders", systemImage: "folder")
+            Label(HumanFormat.size(model.progress.allocatedBytes), systemImage: "internaldrive")
+            Text("\(itemsPerSecond.formatted()) items/s")
+              .monospacedDigit()
+              .foregroundStyle(.secondary)
+            Text(HumanFormat.duration(elapsed))
+              .monospacedDigit()
+              .foregroundStyle(.secondary)
+            if model.progress.inaccessible > 0 {
+              Label(
+                "\(model.progress.inaccessible.formatted()) inaccessible",
+                systemImage: "exclamationmark.triangle"
+              )
+              .foregroundStyle(.orange)
+            }
+            Spacer()
+            Text(model.statusMessage).foregroundStyle(.secondary)
+          }
+          HStack(spacing: 6) {
+            Image(systemName: "location")
+              .foregroundStyle(.tertiary)
+            Text(model.progress.currentPath)
+              .lineLimit(1)
+              .truncationMode(.middle)
+              .foregroundStyle(.secondary)
+            Spacer()
+          }
+        }
+        .font(.caption)
+        .padding(.horizontal, 12)
+        .frame(height: 48)
+      }
+    } else {
+      HStack(spacing: 12) {
+        if let scan = model.currentScan {
+          Label("\(scan.itemCount.formatted()) items", systemImage: "doc.on.doc")
+          Label(HumanFormat.size(scan.allocatedBytes), systemImage: "internaldrive")
+          if scan.inaccessibleCount > 0 {
+            Label("\(scan.inaccessibleCount) inaccessible", systemImage: "exclamationmark.triangle")
+              .foregroundStyle(.orange)
+          }
+        }
+        Text(model.statusMessage)
+          .lineLimit(1)
+          .truncationMode(.middle)
+          .foregroundStyle(.secondary)
+        Spacer()
+        Image(systemName: "info.circle")
+          .foregroundStyle(.tertiary)
+          .help("Logical and allocated sizes may differ on APFS.")
+      }
+      .font(.caption)
+      .padding(.horizontal, 12)
+      .frame(height: 34)
     }
   }
 
-  private var statusBar: some View {
-    HStack(spacing: 12) {
-      if model.isScanning {
-        ProgressView().controlSize(.small)
-        Text(
-          "\(model.progress.files.formatted()) files, \(model.progress.directories.formatted()) folders"
-        )
-        Text(HumanFormat.size(model.progress.allocatedBytes))
-      } else if let scan = model.currentScan {
-        Text("\(scan.itemCount.formatted()) items")
-        Text(HumanFormat.size(scan.allocatedBytes))
-        if scan.inaccessibleCount > 0 {
-          Label("\(scan.inaccessibleCount) inaccessible", systemImage: "exclamationmark.triangle")
-        }
-      }
-      Text(model.statusMessage).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
-      Spacer()
-      Text("Logical and allocated sizes may differ on APFS.").font(.caption).foregroundStyle(
-        .tertiary)
-    }.font(.caption).padding(.horizontal, 10).frame(height: 28)
+  private var appVersion: String {
+    Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
   }
 
   private var welcome: some View {
@@ -278,53 +420,153 @@ struct SettingsView: View {
 
 private struct FilterPanel: View {
   @ObservedObject var model: AppModel
+  @Environment(\.dismiss) private var dismiss
 
   var body: some View {
-    Form {
-      Section("Statuses") {
-        ForEach(SafetyStatus.allCases, id: \.self) { status in
-          Toggle(
-            status.localizedTitle,
-            isOn: Binding(
-              get: { model.selectedStatuses.contains(status) },
-              set: { enabled in
-                if enabled {
-                  model.selectedStatuses.insert(status)
-                } else {
-                  model.selectedStatuses.remove(status)
-                }
-              }
-            ))
-        }
-      }
-      TextField("Extensions, comma-separated", text: $model.extensionFilter)
+    VStack(spacing: 0) {
       HStack {
-        TextField("Min MB", text: $model.minimumSizeMB)
-        TextField("Max MB", text: $model.maximumSizeMB)
-      }
-      Toggle("Duplicates only", isOn: $model.duplicatesOnly)
-      Toggle("Modified after", isOn: $model.useModifiedAfter)
-      if model.useModifiedAfter {
-        DatePicker("", selection: $model.modifiedAfter, displayedComponents: .date).labelsHidden()
-      }
-      Toggle("Modified before", isOn: $model.useModifiedBefore)
-      if model.useModifiedBefore {
-        DatePicker("", selection: $model.modifiedBefore, displayedComponents: .date).labelsHidden()
-      }
-      HStack {
-        Button("Reset") {
-          model.selectedStatuses = []
-          model.extensionFilter = ""
-          model.minimumSizeMB = ""
-          model.maximumSizeMB = ""
-          model.duplicatesOnly = false
-          model.useModifiedAfter = false
-          model.useModifiedBefore = false
-          model.applyFilter()
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Filters").font(.headline)
+          Text("Narrow the current folder without rescanning.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         Spacer()
-        Button("Apply") { model.applyFilter() }.buttonStyle(.borderedProminent)
+        if model.activeFilterCount > 0 {
+          Text("\(model.activeFilterCount.formatted()) active")
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+        }
+      }
+      .padding(18)
+
+      Divider()
+
+      ScrollView {
+        VStack(alignment: .leading, spacing: 20) {
+          filterSection("Statuses") {
+            VStack(alignment: .leading, spacing: 9) {
+              ForEach(SafetyStatus.allCases, id: \.self) { status in
+                Toggle(
+                  isOn: Binding(
+                    get: { model.selectedStatuses.contains(status) },
+                    set: { enabled in
+                      if enabled {
+                        model.selectedStatuses.insert(status)
+                      } else {
+                        model.selectedStatuses.remove(status)
+                      }
+                    })
+                ) {
+                  HStack(spacing: 8) {
+                    Image(systemName: status.symbol)
+                      .foregroundStyle(status.color)
+                      .frame(width: 16)
+                    Text(status.localizedTitle)
+                  }
+                }
+                .toggleStyle(.checkbox)
+              }
+            }
+          }
+
+          filterSection("File type") {
+            VStack(alignment: .leading, spacing: 6) {
+              Text("Extensions, comma-separated")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+              TextField("zip, dmg, mov", text: $model.extensionFilter)
+                .textFieldStyle(.roundedBorder)
+            }
+          }
+
+          filterSection("Size on disk") {
+            HStack(spacing: 12) {
+              VStack(alignment: .leading, spacing: 5) {
+                Text("Minimum (MB)").font(.caption).foregroundStyle(.secondary)
+                TextField("0", text: $model.minimumSizeMB)
+                  .textFieldStyle(.roundedBorder)
+              }
+              VStack(alignment: .leading, spacing: 5) {
+                Text("Maximum (MB)").font(.caption).foregroundStyle(.secondary)
+                TextField("Any", text: $model.maximumSizeMB)
+                  .textFieldStyle(.roundedBorder)
+              }
+            }
+          }
+
+          filterSection("Other") {
+            VStack(alignment: .leading, spacing: 10) {
+              Toggle("Duplicates only", isOn: $model.duplicatesOnly)
+                .toggleStyle(.checkbox)
+              dateFilter(
+                title: "Modified after", enabled: $model.useModifiedAfter,
+                date: $model.modifiedAfter)
+              dateFilter(
+                title: "Modified before", enabled: $model.useModifiedBefore,
+                date: $model.modifiedBefore)
+            }
+          }
+        }
+        .padding(18)
+      }
+
+      Divider()
+
+      HStack {
+        Button("Reset", action: reset)
+          .disabled(model.activeFilterCount == 0)
+        Spacer()
+        Button("Cancel") { dismiss() }
+        Button("Apply") {
+          model.applyFilter()
+          dismiss()
+        }
+        .buttonStyle(.borderedProminent)
+        .keyboardShortcut(.defaultAction)
+      }
+      .padding(14)
+    }
+    .frame(width: 420, height: 590)
+  }
+
+  private func filterSection<Content: View>(
+    _ title: LocalizedStringKey,
+    @ViewBuilder content: () -> Content
+  ) -> some View {
+    VStack(alignment: .leading, spacing: 9) {
+      Text(title)
+        .font(.subheadline.weight(.semibold))
+      content()
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private func dateFilter(
+    title: LocalizedStringKey,
+    enabled: Binding<Bool>,
+    date: Binding<Date>
+  ) -> some View {
+    HStack {
+      Toggle(title, isOn: enabled)
+        .toggleStyle(.checkbox)
+      Spacer()
+      if enabled.wrappedValue {
+        DatePicker("", selection: date, displayedComponents: .date)
+          .labelsHidden()
+          .datePickerStyle(.field)
       }
     }
+  }
+
+  private func reset() {
+    model.selectedStatuses = []
+    model.extensionFilter = ""
+    model.minimumSizeMB = ""
+    model.maximumSizeMB = ""
+    model.duplicatesOnly = false
+    model.useModifiedAfter = false
+    model.useModifiedBefore = false
+    model.applyFilter()
   }
 }

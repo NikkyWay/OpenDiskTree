@@ -81,6 +81,16 @@ final class AppModel: ObservableObject {
     )
   }
 
+  var activeFilterCount: Int {
+    selectedStatuses.count
+      + (extensionFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0 : 1)
+      + (minimumSizeMB.isEmpty ? 0 : 1)
+      + (maximumSizeMB.isEmpty ? 0 : 1)
+      + (duplicatesOnly ? 1 : 0)
+      + (useModifiedAfter ? 1 : 0)
+      + (useModifiedBefore ? 1 : 0)
+  }
+
   func chooseFolder() {
     let panel = NSOpenPanel()
     panel.title = String(localized: "scan.folder")
@@ -115,9 +125,11 @@ final class AppModel: ObservableObject {
         currentScan = record
         currentParentID = 1
         navigationStack = []
+        selectedItem = nil
         let root = try DiskScanner.makeRootItem(scanID: record.id, id: 1, url: url, engine: engine)
         try await store.insert([root])
-        items = [root]
+        items = []
+        directoryItems = [root]
 
         let result = try await activeScanner.scan(
           scanID: record.id,
@@ -129,8 +141,10 @@ final class AppModel: ObservableObject {
               scanID: record.id, parentID: 1, sort: .allocatedSize)
             await MainActor.run {
               self?.progress = update
-              self?.statusMessage = update.currentPath
+              self?.statusMessage = self?.isPaused == true ? "Scan paused." : "Scanning…"
+              guard self?.currentScan?.id == record.id else { return }
               if self?.currentParentID == 1 { self?.items = liveItems }
+              self?.directoryItems = [root] + liveItems.filter(\.kind.canHaveChildren)
             }
           },
           onErrors: { errors in try await store.insert(errors: errors) }
@@ -156,6 +170,7 @@ final class AppModel: ObservableObject {
   func togglePause() {
     guard let scanner else { return }
     isPaused.toggle()
+    statusMessage = isPaused ? "Scan paused." : "Scanning…"
     Task { if isPaused { await scanner.control.pause() } else { await scanner.control.resume() } }
   }
 
@@ -403,6 +418,10 @@ final class AppModel: ObservableObject {
       if currentScan == nil, let first = recentScans.first {
         currentScan = first
         currentParentID = 1
+        statusMessage =
+          first.state == .cancelled
+          ? "Cancelled scan; partial results were kept."
+          : first.state == .failed ? "Scan failed." : "Scan complete."
         try await reloadResults()
       }
     } catch { errorMessage = error.localizedDescription }

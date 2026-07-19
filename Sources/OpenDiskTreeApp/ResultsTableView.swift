@@ -5,6 +5,7 @@ import SwiftUI
 struct ResultsTableView: NSViewRepresentable {
   let items: [ScannedItem]
   let selectedID: Int64?
+  let isScanning: Bool
   let onSelect: (ScannedItem?) -> Void
   let onOpen: (ScannedItem) -> Void
   let onReveal: (ScannedItem) -> Void
@@ -55,14 +56,17 @@ struct ResultsTableView: NSViewRepresentable {
     scroll.documentView = table
     context.coordinator.table = table
     context.coordinator.renderedItems = items
+    context.coordinator.renderedIsScanning = isScanning
     return scroll
   }
 
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     let itemsChanged = context.coordinator.renderedItems != items
+    let scanStateChanged = context.coordinator.renderedIsScanning != isScanning
     context.coordinator.parent = self
     guard let table = scroll.documentView as? NSTableView else { return }
-    context.coordinator.synchronize(table: table, itemsChanged: itemsChanged)
+    context.coordinator.synchronize(
+      table: table, reloadCells: itemsChanged || scanStateChanged)
   }
 
   @MainActor
@@ -70,6 +74,7 @@ struct ResultsTableView: NSViewRepresentable {
     var parent: ResultsTableView
     weak var table: NSTableView?
     fileprivate var renderedItems: [ScannedItem] = []
+    fileprivate var renderedIsScanning = false
     private var isSynchronizingSelection = false
     private let dateFormatter: DateFormatter = {
       let formatter = DateFormatter()
@@ -81,11 +86,12 @@ struct ResultsTableView: NSViewRepresentable {
     init(parent: ResultsTableView) { self.parent = parent }
     func numberOfRows(in tableView: NSTableView) -> Int { parent.items.count }
 
-    fileprivate func synchronize(table: NSTableView, itemsChanged: Bool) {
+    fileprivate func synchronize(table: NSTableView, reloadCells: Bool) {
       isSynchronizingSelection = true
       defer { isSynchronizingSelection = false }
-      if itemsChanged {
+      if reloadCells {
         renderedItems = parent.items
+        renderedIsScanning = parent.isScanning
         table.reloadData()
       }
       let desiredRow = parent.selectedID.flatMap { id in
@@ -127,8 +133,12 @@ struct ResultsTableView: NSViewRepresentable {
         switch identifier.rawValue {
         case "name": item.name
         case "status": item.classification.status.localizedTitle
-        case "allocated": HumanFormat.size(item.allocatedBytes)
-        case "logical": HumanFormat.size(item.logicalBytes)
+        case "allocated":
+          parent.isScanning && item.kind.canHaveChildren
+            ? String(localized: "Calculating…") : HumanFormat.size(item.allocatedBytes)
+        case "logical":
+          parent.isScanning && item.kind.canHaveChildren
+            ? String(localized: "Calculating…") : HumanFormat.size(item.logicalBytes)
         case "modified": item.modifiedAt.map(dateFormatter.string) ?? "—"
         case "path": item.path
         default: ""

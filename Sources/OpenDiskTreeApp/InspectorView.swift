@@ -50,6 +50,6 @@ struct InspectorView: View {
           description: Text("Select a file or folder to inspect it."))
       }
     }
-    .frame(minWidth: 240, idealWidth: 280)
+    .frame(minWidth: 220, idealWidth: 250)
   }
 }

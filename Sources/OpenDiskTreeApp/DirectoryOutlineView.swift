@@ -5,6 +5,7 @@ import SwiftUI
 struct DirectoryOutlineView: NSViewRepresentable {
   let items: [ScannedItem]
   let selectedID: Int64?
+  let isScanning: Bool
   let onSelect: (ScannedItem) -> Void
 
   func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
@@ -29,15 +30,18 @@ struct DirectoryOutlineView: NSViewRepresentable {
     context.coordinator.outline = outline
     context.coordinator.rebuild(items)
     context.coordinator.renderedItems = items
+    context.coordinator.renderedIsScanning = isScanning
     DispatchQueue.main.async { outline.expandItem(nil, expandChildren: false) }
     return scroll
   }
 
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     let itemsChanged = context.coordinator.renderedItems != items
+    let scanStateChanged = context.coordinator.renderedIsScanning != isScanning
     context.coordinator.parent = self
     guard let outline = scroll.documentView as? NSOutlineView else { return }
-    context.coordinator.synchronize(outline: outline, itemsChanged: itemsChanged)
+    context.coordinator.synchronize(
+      outline: outline, rebuildItems: itemsChanged, reloadCells: itemsChanged || scanStateChanged)
   }
 
   @MainActor
@@ -47,6 +51,7 @@ struct DirectoryOutlineView: NSViewRepresentable {
     fileprivate var roots: [DirectoryNode] = []
     fileprivate var nodesByID: [Int64: DirectoryNode] = [:]
     fileprivate var renderedItems: [ScannedItem] = []
+    fileprivate var renderedIsScanning = false
     private var isSynchronizingSelection = false
 
     init(parent: DirectoryOutlineView) { self.parent = parent }
@@ -71,12 +76,17 @@ struct DirectoryOutlineView: NSViewRepresentable {
       }
     }
 
-    fileprivate func synchronize(outline: NSOutlineView, itemsChanged: Bool) {
+    fileprivate func synchronize(
+      outline: NSOutlineView, rebuildItems: Bool, reloadCells: Bool
+    ) {
       isSynchronizingSelection = true
       defer { isSynchronizingSelection = false }
-      if itemsChanged {
+      if rebuildItems {
         renderedItems = parent.items
         rebuild(parent.items)
+      }
+      if reloadCells {
+        renderedIsScanning = parent.isScanning
         outline.reloadData()
       }
       guard let selectedID = parent.selectedID, let node = nodesByID[selectedID] else {
@@ -141,7 +151,9 @@ struct DirectoryOutlineView: NSViewRepresentable {
           return cell
         }()
       cell.textField?.stringValue =
-        "\(node.item.name)  \(HumanFormat.size(node.item.allocatedBytes))"
+        parent.isScanning
+        ? node.item.name
+        : "\(node.item.name)  \(HumanFormat.size(node.item.allocatedBytes))"
       cell.textField?.toolTip = node.item.path
       return cell
     }

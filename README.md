@@ -53,6 +53,8 @@ macOS protects Mail, Messages, browser data and several other directories. To in
 
 Balanced mode limits I/O pressure. Turbo mode uses larger batches and more parallel directory reads. Both modes read file metadata with the same native bulk request used for directory names, stream results into SQLite, keep the UI responsive and support pause or cancellation. A full-disk scan stops at nested mounted volumes such as Simulator runtimes instead of walking the same operating-system data again. A cancelled scan stays marked partial and never replaces a successful comparison snapshot.
 
+While a scan is running, the status bar shows elapsed time, processing rate and the current path. Folder totals and the treemap settle after the final aggregation pass; until then the interface labels them as calculating rather than displaying a misleading zero.
+
 ## Understanding the labels
 
 - **Safe to delete** is reserved for disposable data such as diagnostic logs, with a reason visible in the inspector.
