@@ -1,5 +1,9 @@
 import Darwin
 import Foundation
+import OSLog
+
+private let scannerSignposter = OSSignposter(
+  subsystem: "io.github.NikkyWay.OpenDiskTree", category: "Scanner")
 
 public actor ScanControl {
   private var paused = false
@@ -74,6 +78,8 @@ public final class DiskScanner: Sendable {
     onBatch: @Sendable ([ScannedItem], ScanProgress) async throws -> Void,
     onErrors: @Sendable ([ScanErrorRecord]) async throws -> Void
   ) async throws -> ScannerResult {
+    let signpostState = scannerSignposter.beginInterval("Disk scan")
+    defer { scannerSignposter.endInterval("Disk scan", signpostState) }
     await control.reset()
     let rootPath = options.rootURL.path
     let rootStat = try Self.statItem(path: rootPath)

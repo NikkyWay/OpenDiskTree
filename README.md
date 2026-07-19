@@ -40,7 +40,7 @@ open dist/OpenDiskTree.app
 `build-app.sh` creates an ad-hoc signed application. Release ZIP, DMG and SHA-256 manifest are built with:
 
 ```sh
-./Scripts/release.sh 1.0.0
+./Scripts/release.sh 1.0.1
 ```
 
 GitHub release artifacts are unsigned. On first launch, macOS may require **Control-click → Open**. Developer ID signing and notarization can be added later without changing the application targets.
@@ -92,7 +92,7 @@ The Swift package contains three layers:
 - `OpenDiskTreeCore` owns scanning, SQLite, rules, duplicate detection and exports.
 - `OpenDiskTreeApp` contains the SwiftUI shell and virtualized AppKit outline/table views.
 
-`swift test` covers real temporary directory scans, Unicode paths, packages, symlinks, history, protected aggregation, privacy, exports and duplicate hashing. The current metadata benchmark creates and scans 2,000 files; it completes in roughly 0.6 seconds on the development Mac. Large-disk timings depend heavily on filesystem state, permissions and SSD performance.
+`swift test` covers real temporary directory scans, Unicode paths, packages, symlinks, history, protected aggregation, privacy, exports and duplicate hashing. The quick scanner benchmark creates and scans 2,000 files; it completes in roughly 0.6 seconds on the development Mac. CI also exercises a reduced streaming-persistence benchmark. Before a release, run the million-row profile with `./Scripts/benchmark.sh`; pass another count to reproduce a 1–2 million metadata-row test. One million rows completed in 15.2 seconds on the development Mac. Large-disk timings still depend heavily on filesystem state, permissions and SSD performance.
 
 Contributions are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) first. Security and privacy reports belong in [SECURITY.md](SECURITY.md).
 

@@ -2,6 +2,11 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.1 — 2026-07-19
+
+- Added an Instruments Points of Interest interval around disk scans.
+- Added a bounded, reproducible 1–2 million-row SQLite performance harness; one million rows complete in 15.2 seconds on the development Mac.
+
 ## 1.0.0 — 2026-07-19
 
 - Native Apple Silicon disk scanner using `getattrlistbulk` with a portable POSIX fallback.

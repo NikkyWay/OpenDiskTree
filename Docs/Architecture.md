@@ -16,6 +16,8 @@ Duplicate hashing and export are explicit secondary jobs. They page through SQLi
 
 File actions re-read device and inode identity before using the macOS Trash API. This prevents an item replaced after the scan from being acted on under stale metadata. There is deliberately no permanent-delete function or privileged helper.
 
+Scanner work is wrapped in a Points of Interest signpost named `Disk scan`, so Instruments can correlate traversal time with filesystem and UI activity. `Scripts/benchmark.sh` feeds one million bounded batches through the same SQLite insertion and aggregation path by default; CI uses a smaller 20,000-row run while still exercising the identical code.
+
 ## Snapshot lifecycle
 
 A scan starts as `running`, may become `cancelled` or `failed`, and becomes comparison history only after it reaches `completed`. OpenDiskTree keeps the two latest completed snapshots for each root, which is enough to calculate added, removed, changed and grown items without allowing an interrupted scan to corrupt the baseline.
