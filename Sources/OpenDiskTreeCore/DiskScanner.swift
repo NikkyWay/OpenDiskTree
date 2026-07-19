@@ -94,8 +94,9 @@ public final class DiskScanner: Sendable {
     var bulkCount = 0
     var fallbackCount = 0
     var maximumDepth = 0
+    let batchLimit = options.intensity == .turbo ? 8_192 : 4_096
     var bufferedItems: [ScannedItem] = []
-    bufferedItems.reserveCapacity(2_048)
+    bufferedItems.reserveCapacity(batchLimit)
     var lastFlush = Date()
 
     while cursor < queue.count {
@@ -148,13 +149,10 @@ public final class DiskScanner: Sendable {
 
         for entry in listing.entries {
           guard await control.checkpoint() else { break }
-          let path = URL(fileURLWithPath: outcome.directory.path).appendingPathComponent(entry.name)
-            .path
+          let path =
+            outcome.directory.path == "/"
+            ? "/\(entry.name)" : "\(outcome.directory.path)/\(entry.name)"
           if Self.shouldSkip(path: path, rootPath: rootPath) { continue }
-          if !options.crossSelectedVolume && rootPath != "/" && entry.deviceID != rootStat.deviceID
-          {
-            continue
-          }
 
           let id = nextID
           nextID += 1
@@ -194,18 +192,26 @@ public final class DiskScanner: Sendable {
           )
           bufferedItems.append(item)
           if isContainer {
-            queue.append(
-              PendingDirectory(id: id, path: path, depth: depth, deviceID: entry.deviceID))
             progress.directories += 1
+            if Self.shouldTraverseDirectory(
+              rootDeviceID: rootStat.deviceID,
+              entryDeviceID: entry.deviceID,
+              isMountPoint: entry.isMountPoint,
+              crossSelectedVolume: options.crossSelectedVolume)
+            {
+              queue.append(
+                PendingDirectory(id: id, path: path, depth: depth, deviceID: entry.deviceID))
+            }
           } else {
             progress.files += 1
             progress.logicalBytes &+= ownLogical
             progress.allocatedBytes &+= accountedAllocated
           }
 
-          if bufferedItems.count >= 2_048 {
+          if bufferedItems.count >= batchLimit {
             try await onBatch(bufferedItems, progress)
             bufferedItems.removeAll(keepingCapacity: true)
+            lastFlush = Date()
           }
         }
       }
@@ -267,7 +273,16 @@ public final class DiskScanner: Sendable {
     )
   }
 
-  private static func shouldSkip(path: String, rootPath: String) -> Bool {
+  static func shouldTraverseDirectory(
+    rootDeviceID: UInt64,
+    entryDeviceID: UInt64,
+    isMountPoint: Bool,
+    crossSelectedVolume: Bool
+  ) -> Bool {
+    crossSelectedVolume || (!isMountPoint && entryDeviceID == rootDeviceID)
+  }
+
+  static func shouldSkip(path: String, rootPath: String) -> Bool {
     guard rootPath == "/" else { return false }
     let excluded = [
       "/Volumes", "/System/Volumes/Data", "/System/Volumes/VM", "/System/Volumes/Preboot",

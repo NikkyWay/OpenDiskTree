@@ -210,6 +210,12 @@ public actor ScanStore {
     let state: ScanState = result.cancelled ? .cancelled : .completed
     let finished = Date()
     let root = try fetchItem(scanID: scanID, itemID: rootItemID)
+    let logicalBytes =
+      result.cancelled
+      ? result.progress.logicalBytes : (root?.logicalBytes ?? result.progress.logicalBytes)
+    let allocatedBytes =
+      result.cancelled
+      ? result.progress.allocatedBytes : (root?.allocatedBytes ?? result.progress.allocatedBytes)
     let sql = """
       UPDATE scans SET finished_at=?, state=?, item_count=?, logical_bytes=?, allocated_bytes=?, inaccessible_count=?
       WHERE id=?
@@ -220,8 +226,8 @@ public actor ScanStore {
       [
         .text(Self.dateString(finished)), .text(state.rawValue),
         .integer(result.progress.files + result.progress.directories),
-        .unsigned(root?.logicalBytes ?? result.progress.logicalBytes),
-        .unsigned(root?.allocatedBytes ?? result.progress.allocatedBytes),
+        .unsigned(logicalBytes),
+        .unsigned(allocatedBytes),
         .integer(result.progress.inaccessible), .integer(scanID),
       ], to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)

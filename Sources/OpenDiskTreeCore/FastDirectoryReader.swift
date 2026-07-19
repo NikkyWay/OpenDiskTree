@@ -14,6 +14,7 @@ public struct NativeDirectoryEntry: Sendable {
   public let linkCount: UInt32
   public let isHidden: Bool
   public let isPackage: Bool
+  public let isMountPoint: Bool
 
   public var fileExtension: String? {
     let value = URL(fileURLWithPath: name).pathExtension.lowercased()
@@ -87,7 +88,8 @@ public enum FastDirectoryReader {
             ? Date(timeIntervalSince1970: TimeInterval(raw.modified_seconds)) : nil,
           linkCount: raw.link_count,
           isHidden: raw.is_hidden != 0,
-          isPackage: packageExtensions.contains(ext) && kind == .directory
+          isPackage: packageExtensions.contains(ext) && kind == .directory,
+          isMountPoint: raw.is_mount_point != 0
         ))
     }
     return NativeDirectoryListing(entries: entries, usedBulkAPI: listing.used_bulk_api != 0)

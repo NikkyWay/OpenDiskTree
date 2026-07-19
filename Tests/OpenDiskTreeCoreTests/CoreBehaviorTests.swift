@@ -53,6 +53,44 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   #expect(
     listing.entries.contains { $0.name == "Example.app" && $0.kind == .package && $0.isPackage })
   #expect(listing.entries.contains { $0.name == "loop" && $0.kind == .symbolicLink })
+  let dataEntry = try #require(listing.entries.first { $0.name == "данные.txt" })
+  #expect(dataEntry.logicalBytes == 5)
+  #expect(dataEntry.fileID > 0)
+  #expect(dataEntry.deviceID > 0)
+  #expect(dataEntry.linkCount >= 1)
+}
+
+@Test func fullDiskTraversalDoesNotEnterNestedVolumes() {
+  #expect(
+    !DiskScanner.shouldTraverseDirectory(
+      rootDeviceID: 10, entryDeviceID: 11, isMountPoint: false, crossSelectedVolume: false))
+  #expect(
+    !DiskScanner.shouldTraverseDirectory(
+      rootDeviceID: 10, entryDeviceID: 10, isMountPoint: true, crossSelectedVolume: false))
+  #expect(
+    DiskScanner.shouldTraverseDirectory(
+      rootDeviceID: 10, entryDeviceID: 11, isMountPoint: true, crossSelectedVolume: true))
+}
+
+@Test func cancelledSnapshotUsesLiveProgressTotals() async throws {
+  let workspace = try TestWorkspace()
+  defer { workspace.remove() }
+  let store = try ScanStore(databaseURL: workspace.url.appendingPathComponent("cancelled.sqlite"))
+  let scan = try await store.beginScan(rootURL: workspace.url, intensity: .balanced)
+  let root = try DiskScanner.makeRootItem(scanID: scan.id, id: 1, url: workspace.url)
+  try await store.insert([root])
+  let progress = ScanProgress(
+    files: 8, directories: 3, logicalBytes: 12_345, allocatedBytes: 16_384,
+    currentPath: workspace.url.path)
+  let result = ScannerResult(
+    progress: progress, cancelled: true, bulkDirectoryCount: 1, fallbackDirectoryCount: 0,
+    maximumDepth: 2)
+
+  let finished = try await store.finishScan(scan.id, result: result)
+  #expect(finished.state == .cancelled)
+  #expect(finished.itemCount == 11)
+  #expect(finished.logicalBytes == 12_345)
+  #expect(finished.allocatedBytes == 16_384)
 }
 
 @Test func cleanupRulesAreConservativeAndAdvancedOverridesAreExplicit() {

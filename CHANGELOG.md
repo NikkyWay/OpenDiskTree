@@ -2,6 +2,13 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.2 — 2026-07-19
+
+- Read names, sizes, timestamps, file identity and link counts in the same native metadata batch instead of issuing a separate `stat` call for every item.
+- Stop full-disk scans at nested mounted volumes, including iOS Simulator runtimes, while keeping those mount points visible in results.
+- Increased SQLite insert batches and removed per-item URL construction from the scanner hot path.
+- Cancelled snapshots now retain their live byte totals.
+
 ## 1.0.1 — 2026-07-19
 
 - Added an Instruments Points of Interest interval around disk scans.

@@ -19,6 +19,7 @@ typedef struct {
     uint32_t mode;
     uint32_t link_count;
     uint8_t is_hidden;
+    uint8_t is_mount_point;
 } ODTDirectoryEntry;
 
 typedef struct {

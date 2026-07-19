@@ -51,7 +51,7 @@ Use **Scan Folder** for a normal directory or external local disk. **Scan Full D
 
 macOS protects Mail, Messages, browser data and several other directories. To include them, open **Full Disk Access…**, enable OpenDiskTree in System Settings, quit the app and launch it again. The scanner never installs a privileged helper; paths that remain inaccessible are counted and exported as scan errors.
 
-Balanced mode limits I/O pressure. Turbo mode uses more parallel directory reads. Both modes stream results into SQLite, keep the UI responsive and support pause or cancellation. A cancelled scan stays marked partial and never replaces a successful comparison snapshot.
+Balanced mode limits I/O pressure. Turbo mode uses larger batches and more parallel directory reads. Both modes read file metadata with the same native bulk request used for directory names, stream results into SQLite, keep the UI responsive and support pause or cancellation. A full-disk scan stops at nested mounted volumes such as Simulator runtimes instead of walking the same operating-system data again. A cancelled scan stays marked partial and never replaces a successful comparison snapshot.
 
 ## Understanding the labels
 
