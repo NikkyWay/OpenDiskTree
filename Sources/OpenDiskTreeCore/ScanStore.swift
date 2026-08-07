@@ -120,6 +120,12 @@ public actor ScanStore {
   }
 
   public func beginScan(rootURL: URL, intensity: ScanIntensity) throws -> ScanRecord {
+    // These indexes are only needed for filtering and duplicate queries after a scan.
+    // Maintaining them for every discovered file multiplies random SQLite writes.
+    try database.execute("DROP INDEX IF EXISTS items_path")
+    try database.execute("DROP INDEX IF EXISTS items_status")
+    try database.execute("DROP INDEX IF EXISTS items_duplicate_candidates")
+    try database.execute("DROP INDEX IF EXISTS items_scan_depth")
     let values = try rootURL.resourceValues(forKeys: [.volumeNameKey, .volumeUUIDStringKey])
     let volumeName = values.volumeName ?? rootURL.lastPathComponent
     let now = Date()
@@ -216,6 +222,7 @@ public actor ScanStore {
     if !result.cancelled {
       try aggregateDirectories(scanID: scanID, maximumDepth: result.maximumDepth)
     }
+    try rebuildDeferredIndexes()
     let state: ScanState = result.cancelled ? .cancelled : .completed
     let finished = Date()
     let root = try fetchItem(scanID: scanID, itemID: rootItemID)
@@ -254,6 +261,14 @@ public actor ScanStore {
       to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     try insert(errors: [ScanErrorRecord(scanID: scanID, path: "", code: EIO, message: message)])
+    try? rebuildDeferredIndexes()
+  }
+
+  private func rebuildDeferredIndexes() throws {
+    try database.execute("CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path)")
+    try database.execute("CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status)")
+    try database.execute(
+      "CREATE INDEX IF NOT EXISTS items_duplicate_candidates ON items(scan_id,logical_bytes) WHERE kind='file'")
   }
 
   public func fetchScan(_ id: Int64) throws -> ScanRecord? {
@@ -671,43 +686,78 @@ public actor ScanStore {
   public func compact() throws { try database.execute("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;") }
 
   private func aggregateDirectories(scanID: Int64, maximumDepth: Int) throws {
+    // A depth predicate is used once per level during the bottom-up rollup. Without this
+    // index SQLite scans the complete items table for every depth, which becomes minutes
+    // of work on a million-row snapshot.
+    try database.execute("CREATE INDEX IF NOT EXISTS items_scan_depth ON items(scan_id,depth)")
+    try database.execute(
+      """
+      CREATE TEMP TABLE IF NOT EXISTS odt_folder_rollups(
+        parent_id INTEGER PRIMARY KEY,
+        logical_bytes INTEGER NOT NULL,
+        allocated_bytes INTEGER NOT NULL,
+        risk_rank INTEGER NOT NULL,
+        non_review INTEGER NOT NULL,
+        child_count INTEGER NOT NULL,
+        protected_rule INTEGER NOT NULL
+      )
+      """
+    )
     try database.execute("BEGIN IMMEDIATE")
     do {
       for depth in stride(from: maximumDepth, through: 0, by: -1) {
+        try database.execute("DELETE FROM odt_folder_rollups")
         try executeBound(
           """
-          UPDATE items AS parent SET
-            logical_bytes = own_logical_bytes + COALESCE((SELECT SUM(child.logical_bytes) FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.is_deleted=0),0),
-            allocated_bytes = accounted_allocated_bytes + COALESCE((SELECT SUM(child.allocated_bytes) FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.is_deleted=0),0)
-          WHERE scan_id=? AND depth=? AND kind IN ('directory','package')
+          INSERT INTO odt_folder_rollups(
+            parent_id, logical_bytes, allocated_bytes, risk_rank, non_review, child_count, protected_rule
+          )
+          SELECT parent.id,
+            COALESCE(SUM(child.logical_bytes),0),
+            COALESCE(SUM(child.allocated_bytes),0),
+            COALESCE(MAX(CASE child.safety_status
+              WHEN 'do_not_touch' THEN 5
+              WHEN 'delete_via_source_app' THEN 4
+              WHEN 'mixed' THEN 3
+              WHEN 'review' THEN 2
+              WHEN 'recreated_automatically' THEN 1
+              ELSE 0 END),0),
+            COALESCE(SUM(CASE WHEN child.id IS NULL OR child.safety_status='review' THEN 0 ELSE 1 END),0),
+            COUNT(child.id), COALESCE(MAX(child.is_protected_rule),0)
+          FROM items parent
+          LEFT JOIN items child ON child.scan_id=parent.scan_id
+            AND child.parent_id=parent.id AND child.is_deleted=0
+          WHERE parent.scan_id=? AND parent.depth=? AND parent.kind IN ('directory','package')
+          GROUP BY parent.id
           """, [.integer(scanID), .integer(Int64(depth))])
         try executeBound(
           """
           UPDATE items AS parent SET
+            logical_bytes = parent.own_logical_bytes + COALESCE((SELECT logical_bytes FROM odt_folder_rollups WHERE parent_id=parent.id),0),
+            allocated_bytes = parent.accounted_allocated_bytes + COALESCE((SELECT allocated_bytes FROM odt_folder_rollups WHERE parent_id=parent.id),0),
             safety_status = CASE
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id) THEN safety_status
               WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.safety_status
-              WHEN EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status='do_not_touch') THEN 'do_not_touch'
-              WHEN EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status='delete_via_source_app') THEN 'delete_via_source_app'
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status<>'safe_to_delete') THEN 'safe_to_delete'
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status NOT IN ('safe_to_delete','recreated_automatically')) THEN 'recreated_automatically'
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status<>'review') THEN 'review'
+              WHEN rollup.risk_rank=5 THEN 'do_not_touch'
+              WHEN rollup.risk_rank=4 THEN 'delete_via_source_app'
+              WHEN rollup.risk_rank=0 THEN 'safe_to_delete'
+              WHEN rollup.risk_rank<=1 THEN 'recreated_automatically'
+              WHEN rollup.risk_rank=2 AND rollup.non_review=0 THEN 'review'
               ELSE 'mixed' END,
             reason = CASE
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id) THEN reason
-              WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN reason
-              WHEN EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status='do_not_touch') THEN 'This folder contains protected data and must not be removed directly.'
-              WHEN EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status='delete_via_source_app') THEN 'This folder contains application-managed data. Use the source application for cleanup.'
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status<>'safe_to_delete') THEN 'All scanned contents matched safe cleanup rules.'
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status NOT IN ('safe_to_delete','recreated_automatically')) THEN 'All scanned contents are disposable or can be rebuilt automatically.'
-              WHEN NOT EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id AND child.safety_status<>'review') THEN 'No trusted cleanup rule matched this folder or its contents.'
+              WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.reason
+              WHEN rollup.risk_rank=5 THEN 'This folder contains protected data and must not be removed directly.'
+              WHEN rollup.risk_rank=4 THEN 'This folder contains application-managed data. Use the source application for cleanup.'
+              WHEN rollup.risk_rank=0 THEN 'All scanned contents matched safe cleanup rules.'
+              WHEN rollup.risk_rank<=1 THEN 'All scanned contents are disposable or can be rebuilt automatically.'
+              WHEN rollup.risk_rank=2 AND rollup.non_review=0 THEN 'No trusted cleanup rule matched this folder or its contents.'
               ELSE 'This folder contains mixed safety statuses. Inspect its contents before cleanup.' END,
             rule_id = CASE
-              WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN rule_id
-              WHEN EXISTS(SELECT 1 FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id) THEN 'aggregate.folder'
-              ELSE rule_id END,
-            is_protected_rule = MAX(is_protected_rule, COALESCE((SELECT MAX(child.is_protected_rule) FROM items child WHERE child.scan_id=parent.scan_id AND child.parent_id=parent.id),0))
-          WHERE scan_id=? AND depth=? AND kind IN ('directory','package')
+              WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.rule_id
+              ELSE 'aggregate.folder' END,
+            is_protected_rule = MAX(parent.is_protected_rule, rollup.protected_rule)
+          FROM odt_folder_rollups rollup
+          WHERE parent.scan_id=? AND parent.depth=? AND parent.kind IN ('directory','package')
+            AND parent.id=rollup.parent_id
           """, [.integer(scanID), .integer(Int64(depth))])
       }
       try database.execute("COMMIT")

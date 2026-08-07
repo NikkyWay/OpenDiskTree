@@ -2,6 +2,12 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.4 — 2026-08-07
+
+- Defer path, status and duplicate-candidate indexes until a scan finishes, avoiding three random SQLite index writes per discovered item.
+- Replace the depth-by-depth correlated folder aggregation with an indexed bottom-up rollup, so finalization scales with the number of folders instead of rescanning the full table for every depth.
+- Keep the visible progress counter moving independently of SQLite batch commits and label the final index/aggregation phase as finalizing.
+
 ## 1.0.3 — 2026-08-07
 
 - Removed repeated root-table sorting from the scan hot path; live rows refresh at a controlled cadence while every metadata batch is still persisted immediately.

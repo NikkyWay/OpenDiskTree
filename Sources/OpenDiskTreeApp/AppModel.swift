@@ -180,8 +180,15 @@ final class AppModel: ObservableObject {
               self?.directoryItems = [root] + liveItems.filter(\.kind.canHaveChildren)
             }
           },
-          onErrors: { errors in try await store.insert(errors: errors) }
+          onErrors: { errors in try await store.insert(errors: errors) },
+          onProgress: { [weak self] update in
+            await MainActor.run {
+              self?.progress = update
+              if self?.isScanning == true { self?.statusMessage = "Scanning…" }
+            }
+          }
         )
+        statusMessage = "Finalizing scan…"
         currentScan = try await store.finishScan(record.id, result: result)
         statusMessage =
           result.cancelled ? "Scan cancelled; partial results were kept." : "Scan complete."

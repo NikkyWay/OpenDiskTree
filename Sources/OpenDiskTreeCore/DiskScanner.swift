@@ -76,7 +76,8 @@ public final class DiskScanner: Sendable {
     rootItemID: Int64,
     options: ScanOptions,
     onBatch: @Sendable ([ScannedItem], ScanProgress) async throws -> Void,
-    onErrors: @Sendable ([ScanErrorRecord]) async throws -> Void
+    onErrors: @Sendable ([ScanErrorRecord]) async throws -> Void,
+    onProgress: @Sendable (ScanProgress) async -> Void = { _ in }
   ) async throws -> ScannerResult {
     let signpostState = scannerSignposter.beginInterval("Disk scan")
     defer { scannerSignposter.endInterval("Disk scan", signpostState) }
@@ -100,6 +101,7 @@ public final class DiskScanner: Sendable {
     var bufferedItems: [ScannedItem] = []
     bufferedItems.reserveCapacity(batchLimit)
     var lastFlush = Date()
+    var lastProgressUpdate = Date()
     let minimumFlushCount = options.intensity == .turbo ? 8_192 : 4_096
     let flushInterval: TimeInterval = 0.75
 
@@ -213,6 +215,7 @@ public final class DiskScanner: Sendable {
           }
 
           if bufferedItems.count >= batchLimit {
+            await onProgress(progress)
             try await onBatch(bufferedItems, progress)
             bufferedItems.removeAll(keepingCapacity: true)
             lastFlush = Date()
@@ -220,6 +223,10 @@ public final class DiskScanner: Sendable {
         }
       }
       if !errors.isEmpty { try await onErrors(errors) }
+      if Date().timeIntervalSince(lastProgressUpdate) >= 0.5 {
+        await onProgress(progress)
+        lastProgressUpdate = Date()
+      }
       if bufferedItems.count >= minimumFlushCount
         && Date().timeIntervalSince(lastFlush) >= flushInterval
       {
