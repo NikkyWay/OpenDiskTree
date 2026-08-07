@@ -26,6 +26,7 @@ final class AppModel: ObservableObject {
   @Published var items: [ScannedItem] = []
   @Published var directoryItems: [ScannedItem] = []
   @Published var selectedItem: ScannedItem?
+  @Published var showingLargestItems = false
   @Published var progress = ScanProgress()
   @Published var isScanning = false
   @Published var isPreliminary = false
@@ -136,6 +137,7 @@ final class AppModel: ObservableObject {
     activeSecurityScopedURL = securityScopedURL
     isScanning = true
     isPreliminary = false
+    showingLargestItems = false
     currentScan = nil
     currentParentID = 1
     navigationStack = []
@@ -309,6 +311,7 @@ final class AppModel: ObservableObject {
   func selectScan(_ scan: ScanRecord) {
     guard !isScanning, currentScan?.id != scan.id else { return }
     currentScan = scan
+    showingLargestItems = false
     currentParentID = 1
     navigationStack = []
     selectedItem = nil
@@ -338,10 +341,16 @@ final class AppModel: ObservableObject {
   func reloadResults() async throws {
     guard let store, let scanID = currentScan?.id else { return }
     let parent = currentParentID ?? 1
-    let loadedItems = try await store.fetchChildren(
-      scanID: scanID, parentID: parent, filter: filter, sort: sort)
+    let loadedItems: [ScannedItem]
+    if showingLargestItems {
+      loadedItems = try await store.fetchLargest(
+        scanID: scanID, containers: false, filter: filter, sort: sort, limit: 2_000)
+    } else {
+      loadedItems = try await store.fetchChildren(
+        scanID: scanID, parentID: parent, filter: filter, sort: sort)
+    }
     if items != loadedItems { items = loadedItems }
-    if directoryItems.isEmpty || parent == 1 {
+    if !showingLargestItems && (directoryItems.isEmpty || parent == 1) {
       // Do not decode thousands of directory rows just to open the last snapshot.
       // The outline starts with the root and its immediate children; deeper
       // branches are reached through the table and are loaded on demand.
@@ -366,7 +375,18 @@ final class AppModel: ObservableObject {
 
   func applyFilter() { Task { try? await reloadResults() } }
 
+  func showLargestItems() {
+    guard currentScan != nil, !isScanning else { return }
+    showingLargestItems = true
+    currentParentID = 1
+    navigationStack = []
+    selectedItem = nil
+    statusMessage = "Showing the largest files in this scan."
+    Task { try? await reloadResults() }
+  }
+
   func navigate(into item: ScannedItem) {
+    showingLargestItems = false
     guard item.kind.canHaveChildren else {
       selectedItem = item
       return
@@ -378,6 +398,7 @@ final class AppModel: ObservableObject {
   }
 
   func navigateFromTree(_ item: ScannedItem) {
+    showingLargestItems = false
     guard currentParentID != item.id else {
       if selectedItem != item { selectedItem = item }
       return

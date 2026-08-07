@@ -150,7 +150,9 @@ struct ContentView: View {
         }
         Image(systemName: "folder")
           .foregroundStyle(.secondary)
-        Text(model.navigationStack.last?.path ?? model.currentScan?.rootPath ?? "OpenDiskTree")
+        Text(model.showingLargestItems
+          ? "Largest files on disk"
+          : (model.navigationStack.last?.path ?? model.currentScan?.rootPath ?? "OpenDiskTree"))
           .font(.headline)
           .lineLimit(1)
           .truncationMode(.middle)
@@ -177,6 +179,18 @@ struct ContentView: View {
             Label(String(localized: "scan.cancel"), systemImage: "stop.fill")
           }
         } else {
+          Menu {
+            Button("Scan Folder", action: model.chooseFolder)
+            Button("Scan Full Disk", action: model.scanFullDisk)
+          } label: {
+            Label("New scan", systemImage: "plus.magnifyingglass")
+          }
+          .help("Start a new scan")
+          .menuStyle(.borderedButton)
+          Button(action: model.showLargestItems) {
+            Label("Largest files", systemImage: "arrow.down.right.and.arrow.up.left")
+          }
+          .disabled(model.currentScan == nil)
           Button(action: model.findDuplicates) {
             Label("Duplicates", systemImage: "square.on.square")
           }
@@ -209,6 +223,11 @@ struct ContentView: View {
           FilterPanel(model: model)
         }
         Spacer()
+        if model.currentScan != nil && !model.isScanning && !model.showingLargestItems {
+          Text("Double-click a folder to open it")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+        }
         Text("Size")
           .font(.caption)
           .foregroundStyle(.secondary)

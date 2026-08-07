@@ -22,6 +22,7 @@ The app combines a directory outline, sortable file table and treemap. Known dat
 - On-demand duplicate detection using size, sample hashes and full SHA-256 verification.
 - The two latest successful snapshots per root, including added, removed and grown files.
 - Complete JSON, CSV and SQLite exports for the full scan, current filter or selected subtree.
+- A `Largest files` view jumps directly to the biggest files in the current snapshot.
 - Compact AI reports with configurable limits and full, basic or strict path privacy.
 - English and Russian interface, local custom rules and no telemetry.
 

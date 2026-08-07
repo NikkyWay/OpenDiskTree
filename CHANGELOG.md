@@ -2,6 +2,12 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.10 — 2026-08-07
+
+- Add a persistent New scan menu to the main toolbar so starting a scan does not depend on the sidebar being visible.
+- Add a Largest files view that lists the biggest files across the current snapshot without drilling through every folder.
+- Add a visible double-click hint and a dedicated breadcrumb title for the largest-files view.
+
 ## 1.0.9 — 2026-08-07
 
 - Add a composite parent/size index so opening a large snapshot does not sort the entire items table to show the root.
