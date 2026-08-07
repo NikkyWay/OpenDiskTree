@@ -79,16 +79,17 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 7) {
               HStack {
                 ProgressView().controlSize(.small)
-                Text(model.isPaused ? "Paused" : "Reading disk…").fontWeight(.medium)
+                Text(model.isPaused ? "Paused" : (model.isPreliminary ? "Quick overview…" : "Reading disk…"))
+                  .fontWeight(.medium)
               }
               Text(model.currentScan?.rootPath ?? model.progress.currentPath)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-              Text(
-                "\((model.progress.files + model.progress.directories).formatted()) items found"
-              )
+              Text(model.isPreliminary
+                ? "\(max(0, model.directoryItems.count - 1).formatted()) top-level entries estimated"
+                : "\((model.progress.files + model.progress.directories).formatted()) items found")
               .font(.caption)
               .foregroundStyle(.secondary)
             }
@@ -155,14 +156,14 @@ struct ContentView: View {
           .truncationMode(.middle)
         if model.isScanning {
           Label(
-            model.isPaused ? "Paused" : "Scanning",
-            systemImage: model.isPaused ? "pause.fill" : "waveform.path"
+            model.isPaused ? "Paused" : (model.isPreliminary ? "Quick overview" : "Scanning"),
+            systemImage: model.isPaused ? "pause.fill" : (model.isPreliminary ? "bolt.fill" : "waveform.path")
           )
           .font(.caption.weight(.semibold))
-          .foregroundStyle(model.isPaused ? .orange : .blue)
+          .foregroundStyle(model.isPaused ? .orange : (model.isPreliminary ? .purple : .blue))
           .padding(.horizontal, 8)
           .padding(.vertical, 4)
-          .background((model.isPaused ? Color.orange : Color.blue).opacity(0.12))
+          .background((model.isPaused ? Color.orange : (model.isPreliminary ? Color.purple : Color.blue)).opacity(0.12))
           .clipShape(Capsule())
         }
         Spacer(minLength: 12)
@@ -307,10 +308,15 @@ struct ContentView: View {
             } else {
               ProgressView().controlSize(.small)
             }
-            Label("\(model.progress.files.formatted()) files", systemImage: "doc")
-            Label("\(model.progress.directories.formatted()) folders", systemImage: "folder")
+            if model.isPreliminary {
+              Label("\(model.items.count.formatted()) top-level entries", systemImage: "folder")
+                .foregroundStyle(.purple)
+            } else {
+              Label("\(model.progress.files.formatted()) files", systemImage: "doc")
+              Label("\(model.progress.directories.formatted()) folders", systemImage: "folder")
+            }
             Label(HumanFormat.size(model.progress.allocatedBytes), systemImage: "internaldrive")
-            Text("\(itemsPerSecond.formatted()) items/s")
+            Text(model.isPreliminary ? "estimated" : "\(itemsPerSecond.formatted()) items/s")
               .monospacedDigit()
               .foregroundStyle(.secondary)
             Text(HumanFormat.duration(elapsed))

@@ -60,6 +60,21 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   #expect(dataEntry.linkCount >= 1)
 }
 
+@Test func fastOverviewListsOnlyTheSelectedDirectory() async throws {
+  let workspace = try TestWorkspace()
+  defer { workspace.remove() }
+  try write("hello", to: workspace.url.appendingPathComponent("visible.txt"))
+  let nested = workspace.url.appendingPathComponent("Nested", isDirectory: true)
+  try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+  try write("not part of the first pass", to: nested.appendingPathComponent("inside.txt"))
+
+  let result = await FastOverviewScanner.scan(rootURL: workspace.url)
+  #expect(result.inaccessibleCount == 0)
+  #expect(result.children.contains { $0.name == "visible.txt" && $0.allocatedBytes > 0 })
+  #expect(result.children.contains { $0.name == "Nested" && $0.kind == .directory })
+  #expect(result.root?.path == workspace.url.path)
+}
+
 @Test func fullDiskTraversalDoesNotEnterNestedVolumes() {
   #expect(
     !DiskScanner.shouldTraverseDirectory(

@@ -28,6 +28,7 @@ final class AppModel: ObservableObject {
   @Published var selectedItem: ScannedItem?
   @Published var progress = ScanProgress()
   @Published var isScanning = false
+  @Published var isPreliminary = false
   @Published var isPaused = false
   @Published var isFindingDuplicates = false
   @Published var duplicateProgress: DuplicateProgress?
@@ -63,6 +64,7 @@ final class AppModel: ObservableObject {
   private(set) var store: ScanStore?
   private var scanner: DiskScanner?
   private var scanTask: Task<Void, Never>?
+  private var overviewTask: Task<FastOverviewResult, Never>?
   private var activeSecurityScopedURL: URL?
   private let bookmarkDefaultsKey = "securityScopedScanBookmarks"
   private let duplicateFinder = DuplicateFinder()
@@ -132,16 +134,36 @@ final class AppModel: ObservableObject {
     }
     let securityScopedURL = url.startAccessingSecurityScopedResource() ? url : nil
     activeSecurityScopedURL = securityScopedURL
+    isScanning = true
+    isPreliminary = false
+    currentScan = nil
+    currentParentID = 1
+    navigationStack = []
+    selectedItem = nil
+    items = []
+    directoryItems = []
+    progress = ScanProgress(currentPath: url.path)
+    statusMessage = "Quick overview…"
     scanTask = Task {
       defer {
         if let securityScopedURL { securityScopedURL.stopAccessingSecurityScopedResource() }
         activeSecurityScopedURL = nil
+        overviewTask?.cancel()
+        overviewTask = nil
       }
       do {
-        isScanning = true
         isPaused = false
-        progress = ScanProgress(currentPath: url.path)
-        statusMessage = "Preparing scan…"
+        let pendingOverview = Task.detached(priority: .userInitiated) {
+          await FastOverviewScanner.scan(rootURL: url)
+        }
+        overviewTask = pendingOverview
+        Task { [weak self] in
+          let overview = await pendingOverview.value
+          guard let self, self.isScanning, self.currentScan == nil else { return }
+          self.applyFastOverview(overview, rootURL: url)
+        }
+
+        statusMessage = "Preparing exact scan…"
         let rules = try await store.loadUserRules()
         userRules = rules
         let engine = RuleEngine(userRules: rules, allowProtectedOverrides: advancedRuleOverrides)
@@ -149,6 +171,7 @@ final class AppModel: ObservableObject {
         scanner = activeScanner
         let record = try await store.beginScan(rootURL: url, intensity: intensity)
         currentScan = record
+        isPreliminary = false
         currentParentID = 1
         navigationStack = []
         selectedItem = nil
@@ -207,6 +230,42 @@ final class AppModel: ObservableObject {
     }
   }
 
+  private func applyFastOverview(_ result: FastOverviewResult, rootURL: URL) {
+    guard isScanning, currentScan == nil else { return }
+    let engine = RuleEngine()
+    let rootInfo = result.root
+    let rootBytes = rootInfo?.allocatedBytes ?? result.children.reduce(0) { $0 &+ $1.allocatedBytes }
+    let root = ScannedItem(
+      id: 1, scanID: 0, parentID: nil, path: rootURL.path,
+      name: rootURL.lastPathComponent.isEmpty ? rootURL.path : rootURL.lastPathComponent,
+      depth: 0, kind: .directory, fileExtension: nil,
+      ownLogicalBytes: 0, ownAllocatedBytes: 0, accountedAllocatedBytes: rootBytes,
+      logicalBytes: rootInfo?.logicalBytes ?? rootBytes, allocatedBytes: rootBytes,
+      createdAt: nil, modifiedAt: nil, deviceID: 0, fileID: 0, linkCount: 1,
+      isHidden: false, isPackage: false, classification: engine.classify(path: rootURL.path, kind: .directory))
+    let children = result.children.enumerated().map { offset, entry in
+      ScannedItem(
+        id: -Int64(offset + 1), scanID: 0, parentID: 1, path: entry.path, name: entry.name,
+        depth: 1, kind: entry.kind, fileExtension: nil,
+        ownLogicalBytes: 0, ownAllocatedBytes: 0, accountedAllocatedBytes: entry.allocatedBytes,
+        logicalBytes: entry.logicalBytes, allocatedBytes: entry.allocatedBytes,
+        createdAt: nil, modifiedAt: nil, deviceID: 0, fileID: 0, linkCount: 1,
+        isHidden: entry.name.hasPrefix("."), isPackage: entry.kind == .package,
+        classification: Classification(
+          status: .review, ruleID: nil,
+          reason: "Preliminary top-level listing. The exact scan is still running.",
+          confidence: .medium))
+    }
+    items = children
+    directoryItems = [root] + children
+    currentParentID = 1
+    isPreliminary = true
+    progress.logicalBytes = root.logicalBytes
+    progress.allocatedBytes = root.allocatedBytes
+    progress.inaccessible = result.inaccessibleCount
+    statusMessage = "Quick overview ready — top-level sizes are partial; exact scan continues…"
+  }
+
   private func saveSecurityScopedBookmark(for url: URL) {
     guard let data = try? url.bookmarkData(
       options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
@@ -238,9 +297,13 @@ final class AppModel: ObservableObject {
   }
 
   func cancelScan() {
-    guard let scanner else { return }
+    guard isScanning else { return }
     statusMessage = "Cancelling…"
-    Task { await scanner.control.cancel() }
+    overviewTask?.cancel()
+    scanTask?.cancel()
+    if let scanner {
+      Task { await scanner.control.cancel() }
+    }
   }
 
   func selectScan(_ scan: ScanRecord) {

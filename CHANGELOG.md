@@ -2,6 +2,12 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.6 — 2026-08-07
+
+- Add a fast overview pass that shows depth-limited folder totals while the exact metadata scan runs in the background.
+- Mark preliminary totals and estimates explicitly; they are never mixed into the exact SQLite snapshot.
+- Cancel the quick pass together with the exact scan and keep the existing exact results authoritative.
+
 ## 1.0.5 — 2026-08-07
 
 - Keep one SQLite transaction open for the active scan; cancellation and normal completion still finalize a consistent snapshot.

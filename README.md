@@ -13,6 +13,7 @@ The app combines a directory outline, sortable file table and treemap. Known dat
 ## Highlights
 
 - Fast metadata traversal with macOS `getattrlistbulk`, bounded concurrency and a POSIX fallback for other local filesystems.
+- A quick overview appears while the exact scan runs: depth-limited folder totals are available first and are clearly marked as estimates until the exact snapshot replaces them.
 - Logical and allocated sizes, with hard-linked blocks counted once in totals.
 - Search plus filters for extension, status, size, modification date and duplicates.
 - Five safety states: safe to delete, recreated automatically, delete through the source application, do not touch and review.
@@ -59,7 +60,7 @@ When you choose a folder through **Scan Folder**, OpenDiskTree stores a macOS se
 
 Balanced mode limits I/O pressure. Turbo mode uses larger batches and more parallel directory reads. Both modes read file metadata with the same native bulk request used for directory names, keep one transaction for the active scan, defer nonessential SQLite indexes until the scan finishes, and refresh the visible table at a controlled cadence so a large scan does not repeatedly sort the same root rows. Folder totals and safety labels are finalized with an indexed bottom-up rollup rather than repeated full-table passes. A full-disk scan stops at nested mounted volumes such as Simulator runtimes instead of walking the same operating-system data again. A cancelled scan stays marked partial and never replaces a successful comparison snapshot.
 
-The app can show the first useful rows while a scan is still running, but a complete scan must still enumerate every visible filesystem object. macOS does not expose a Windows-MFT equivalent for an exact, permission-aware disk tree, so a laptop with hundreds of thousands or millions of entries cannot be guaranteed to finish in a few seconds. The optimized path removes avoidable database/UI work; SSD speed, permissions and the number of files remain the limiting factors.
+The app starts a separate quick overview while the exact scan is preparing. It lists the selected directory immediately using the same native bulk metadata request, shows sizes for entries that are files, labels folder totals as partial estimates, and never writes those provisional rows into the exact SQLite snapshot. The exact scan then enumerates every visible filesystem object and replaces the overview with real files, statuses and metadata. macOS does not expose a Windows-MFT equivalent for an exact, permission-aware disk tree, so a laptop with hundreds of thousands or millions of entries cannot be guaranteed to finish in a few seconds. The optimized path removes avoidable database/UI work; SSD speed, permissions and the number of files remain the limiting factors.
 
 While a scan is running, the status bar shows elapsed time, processing rate and the current path. Folder totals and the treemap settle after the final aggregation pass; until then the interface labels them as calculating rather than displaying a misleading zero.
 
