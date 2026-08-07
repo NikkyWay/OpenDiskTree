@@ -2,6 +2,10 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.7 — 2026-08-07
+
+- Keep startup responsive by loading the root outline lazily instead of decoding thousands of historical folders at once.
+
 ## 1.0.6 — 2026-08-07
 
 - Add a fast overview pass that shows depth-limited folder totals while the exact metadata scan runs in the background.

@@ -342,7 +342,17 @@ final class AppModel: ObservableObject {
       scanID: scanID, parentID: parent, filter: filter, sort: sort)
     if items != loadedItems { items = loadedItems }
     if directoryItems.isEmpty || parent == 1 {
-      let loadedDirectories = try await store.fetchDirectoryTree(scanID: scanID)
+      // Do not decode thousands of directory rows just to open the last snapshot.
+      // The outline starts with the root and its immediate children; deeper
+      // branches are reached through the table and are loaded on demand.
+      let loadedDirectories: [ScannedItem]
+      if let root = try await store.fetchItem(scanID: scanID, itemID: 1) {
+        let topLevel = try await store.fetchChildren(
+          scanID: scanID, parentID: 1, sort: .allocatedSize, limit: 2_000)
+        loadedDirectories = [root] + topLevel.filter(\.kind.canHaveChildren)
+      } else {
+        loadedDirectories = []
+      }
       if directoryItems != loadedDirectories { directoryItems = loadedDirectories }
     }
     if let selectedItem {
