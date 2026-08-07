@@ -82,6 +82,26 @@ private final class SQLiteConnection {
     }
   }
 
+  @inline(__always)
+  func bind(_ value: SQLValue, at index: Int32, to statement: OpaquePointer, sql: String) throws {
+    let result: Int32
+    switch value {
+    case .integer(let number): result = sqlite3_bind_int64(statement, index, number)
+    case .unsigned(let number):
+      result = sqlite3_bind_int64(statement, index, Int64(clamping: number))
+    case .text(let text):
+      result = text.withCString {
+        sqlite3_bind_text(
+          statement, index, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+      }
+    case .null: result = sqlite3_bind_null(statement, index)
+    }
+    if result != SQLITE_OK {
+      throw StoreError.sqlite(
+        code: result, message: String(cString: sqlite3_errmsg(handle)), sql: sql)
+    }
+  }
+
   func stepDone(_ statement: OpaquePointer, sql: String) throws {
     let result = sqlite3_step(statement)
     guard result == SQLITE_DONE else {
@@ -104,6 +124,7 @@ public actor ScanStore {
 
   public nonisolated let databaseURL: URL
   private let database: SQLiteConnection
+  private var activeStreamingScanID: Int64?
 
   public init(databaseURL: URL? = nil) throws {
     if let databaseURL {
@@ -142,6 +163,8 @@ public actor ScanStore {
       ], to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     let id = sqlite3_last_insert_rowid(database.handle)
+    try database.execute("BEGIN IMMEDIATE")
+    activeStreamingScanID = id
     return ScanRecord(
       id: id, rootPath: rootURL.path, volumeName: volumeName, volumeUUID: values.volumeUUIDString,
       startedAt: now, finishedAt: nil, state: .running, intensity: intensity,
@@ -162,36 +185,57 @@ public actor ScanStore {
       """
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
-    try database.execute("BEGIN IMMEDIATE")
+    let ownsTransaction = activeStreamingScanID == nil
+    if ownsTransaction { try database.execute("BEGIN IMMEDIATE") }
     do {
       for item in items {
-        try database.bind(
-          [
-            .integer(item.id), .integer(item.scanID), item.parentID.map(SQLValue.integer) ?? .null,
-            .text(item.path), .text(item.name), .integer(Int64(item.depth)),
-            .text(item.kind.rawValue),
-            item.fileExtension.map(SQLValue.text) ?? .null,
-            .unsigned(item.ownLogicalBytes), .unsigned(item.ownAllocatedBytes),
-            .unsigned(item.accountedAllocatedBytes),
-            .unsigned(item.logicalBytes), .unsigned(item.allocatedBytes),
-            item.createdAt.map { .text(Self.dateString($0)) } ?? .null,
-            item.modifiedAt.map { .text(Self.dateString($0)) } ?? .null,
-            .unsigned(item.deviceID), .unsigned(item.fileID), .integer(Int64(item.linkCount)),
-            .integer(item.isHidden ? 1 : 0), .integer(item.isPackage ? 1 : 0),
-            .text(item.classification.status.rawValue),
-            item.classification.ruleID.map(SQLValue.text) ?? .null,
-            .text(item.classification.reason), .text(item.classification.confidence.rawValue),
-            item.classification.sourceApplication.map(SQLValue.text) ?? .null,
-            .integer(item.classification.isProtectedRule ? 1 : 0),
-            item.duplicateGroupID.map(SQLValue.integer) ?? .null, .integer(item.isDeleted ? 1 : 0),
-          ], to: statement, sql: sql)
+        try bind(item, to: statement, sql: sql)
         try database.stepDone(statement, sql: sql)
       }
-      try database.execute("COMMIT")
+      if ownsTransaction { try database.execute("COMMIT") }
     } catch {
-      try? database.execute("ROLLBACK")
+      if ownsTransaction { try? database.execute("ROLLBACK") }
       throw error
     }
+  }
+
+  private func bind(_ item: ScannedItem, to statement: OpaquePointer, sql: String) throws {
+    sqlite3_clear_bindings(statement)
+    var index: Int32 = 1
+    @inline(__always) func put(_ value: SQLValue) throws {
+      try database.bind(value, at: index, to: statement, sql: sql)
+      index += 1
+    }
+    try put(.integer(item.id))
+    try put(.integer(item.scanID))
+    try put(item.parentID.map(SQLValue.integer) ?? .null)
+    try put(.text(item.path))
+    try put(.text(item.name))
+    try put(.integer(Int64(item.depth)))
+    try put(.text(item.kind.rawValue))
+    try put(item.fileExtension.map(SQLValue.text) ?? .null)
+    try put(.unsigned(item.ownLogicalBytes))
+    try put(.unsigned(item.ownAllocatedBytes))
+    try put(.unsigned(item.accountedAllocatedBytes))
+    try put(.unsigned(item.logicalBytes))
+    try put(.unsigned(item.allocatedBytes))
+    // File timestamps arrive as whole seconds from getattrlistbulk. Keep the hot-path
+    // representation numeric; JSON/CSV exporters still render RFC 3339 from Date.
+    try put(item.createdAt.map { .integer(Int64($0.timeIntervalSince1970.rounded())) } ?? .null)
+    try put(item.modifiedAt.map { .integer(Int64($0.timeIntervalSince1970.rounded())) } ?? .null)
+    try put(.unsigned(item.deviceID))
+    try put(.unsigned(item.fileID))
+    try put(.integer(Int64(item.linkCount)))
+    try put(.integer(item.isHidden ? 1 : 0))
+    try put(.integer(item.isPackage ? 1 : 0))
+    try put(.text(item.classification.status.rawValue))
+    try put(item.classification.ruleID.map(SQLValue.text) ?? .null)
+    try put(.text(item.classification.reason))
+    try put(.text(item.classification.confidence.rawValue))
+    try put(item.classification.sourceApplication.map(SQLValue.text) ?? .null)
+    try put(.integer(item.classification.isProtectedRule ? 1 : 0))
+    try put(item.duplicateGroupID.map(SQLValue.integer) ?? .null)
+    try put(.integer(item.isDeleted ? 1 : 0))
   }
 
   public func insert(errors: [ScanErrorRecord]) throws {
@@ -199,7 +243,8 @@ public actor ScanStore {
     let sql = "INSERT INTO scan_errors(scan_id, path, error_code, message) VALUES(?,?,?,?)"
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
-    try database.execute("BEGIN IMMEDIATE")
+    let ownsTransaction = activeStreamingScanID == nil
+    if ownsTransaction { try database.execute("BEGIN IMMEDIATE") }
     do {
       for error in errors {
         try database.bind(
@@ -209,9 +254,9 @@ public actor ScanStore {
           ], to: statement, sql: sql)
         try database.stepDone(statement, sql: sql)
       }
-      try database.execute("COMMIT")
+      if ownsTransaction { try database.execute("COMMIT") }
     } catch {
-      try? database.execute("ROLLBACK")
+      if ownsTransaction { try? database.execute("ROLLBACK") }
       throw error
     }
   }
@@ -249,10 +294,18 @@ public actor ScanStore {
     try database.stepDone(statement, sql: sql)
     guard let scan = try fetchScan(scanID) else { throw StoreError.missingScan(scanID) }
     if state == .completed { try pruneCompletedHistory(rootPath: scan.rootPath, keeping: 2) }
+    if activeStreamingScanID == scanID {
+      try database.execute("COMMIT")
+      activeStreamingScanID = nil
+    }
     return scan
   }
 
   public func failScan(_ scanID: Int64, message: String) throws {
+    if activeStreamingScanID == scanID {
+      if (try? database.execute("COMMIT")) == nil { try? database.execute("ROLLBACK") }
+      activeStreamingScanID = nil
+    }
     let sql = "UPDATE scans SET finished_at=?, state=? WHERE id=?"
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
@@ -703,7 +756,8 @@ public actor ScanStore {
       )
       """
     )
-    try database.execute("BEGIN IMMEDIATE")
+    let ownsTransaction = activeStreamingScanID == nil
+    if ownsTransaction { try database.execute("BEGIN IMMEDIATE") }
     do {
       for depth in stride(from: maximumDepth, through: 0, by: -1) {
         try database.execute("DELETE FROM odt_folder_rollups")
@@ -760,9 +814,9 @@ public actor ScanStore {
             AND parent.id=rollup.parent_id
           """, [.integer(scanID), .integer(Int64(depth))])
       }
-      try database.execute("COMMIT")
+      if ownsTransaction { try database.execute("COMMIT") }
     } catch {
-      try? database.execute("ROLLBACK")
+      if ownsTransaction { try? database.execute("ROLLBACK") }
       throw error
     }
   }
@@ -1070,6 +1124,7 @@ public actor ScanStore {
 
   private static func date(_ string: String?) -> Date? {
     guard let string else { return nil }
+    if let seconds = TimeInterval(string) { return Date(timeIntervalSince1970: seconds) }
     return iso8601Formatter.value.date(from: string)
   }
 }

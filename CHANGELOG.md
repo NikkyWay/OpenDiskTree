@@ -2,6 +2,12 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.5 — 2026-08-07
+
+- Keep one SQLite transaction open for the active scan; cancellation and normal completion still finalize a consistent snapshot.
+- Bind item fields directly instead of allocating a 28-value temporary array for every file, and store bulk file timestamps numerically in SQLite while keeping RFC 3339 export output.
+- Increase the native `getattrlistbulk` buffer to 256 KiB for wide directories such as dependency trees.
+
 ## 1.0.4 — 2026-08-07
 
 - Defer path, status and duplicate-candidate indexes until a scan finishes, avoiding three random SQLite index writes per discovered item.

@@ -130,7 +130,9 @@ ODTDirectoryListing odt_read_directory(const char *path) {
     attributes.dirattr = ATTR_DIR_MOUNTSTATUS;
     attributes.fileattr = ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE;
 
-    char buffer[64 * 1024];
+    // A larger bulk buffer reduces getattrlistbulk syscalls for node_modules and other
+    // wide directories while staying small enough for the bounded reader concurrency.
+    char buffer[256 * 1024];
     size_t capacity = 0;
     int bulk_failed = 0;
     for (;;) {
