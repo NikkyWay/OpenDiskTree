@@ -551,7 +551,10 @@ final class AppModel: ObservableObject {
     guard let store else { return }
     do {
       recentScans = try await store.recentScans()
-      if currentScan == nil, let first = recentScans.first {
+      // A process can be terminated while SQLite is preparing a scan, leaving
+      // a running record with no items. Never select that incomplete record on
+      // launch; keep the last usable snapshot visible instead.
+      if currentScan == nil, let first = recentScans.first(where: { $0.state != .running }) {
         currentScan = first
         currentParentID = 1
         statusMessage =

@@ -2,6 +2,14 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.9 — 2026-08-07
+
+- Add a composite parent/size index so opening a large snapshot does not sort the entire items table to show the root.
+
+## 1.0.8 — 2026-08-07
+
+- Do not reopen a scan record left in `running` state after an interrupted launch; keep the latest usable snapshot selected.
+
 ## 1.0.7 — 2026-08-07
 
 - Keep startup responsive by loading the root outline lazily instead of decoding thousands of historical folders at once.

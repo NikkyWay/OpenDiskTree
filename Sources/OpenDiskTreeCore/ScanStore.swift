@@ -874,6 +874,7 @@ public actor ScanStore {
         PRIMARY KEY(scan_id,id)
       );
       CREATE INDEX IF NOT EXISTS items_parent ON items(scan_id,parent_id);
+      CREATE INDEX IF NOT EXISTS items_parent_size ON items(scan_id,parent_id,allocated_bytes DESC);
       CREATE INDEX IF NOT EXISTS items_size ON items(scan_id,allocated_bytes DESC);
       CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path);
       CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status);
