@@ -19,6 +19,11 @@ public enum ScanState: String, Codable, Sendable {
   case failed
 }
 
+public enum ScanMode: String, Codable, CaseIterable, Sendable {
+  case full
+  case incremental
+}
+
 public enum ItemKind: String, Codable, CaseIterable, Sendable {
   case file
   case directory
@@ -236,6 +241,9 @@ public struct ScanRecord: Identifiable, Codable, Sendable, Equatable {
   public var finishedAt: Date?
   public var state: ScanState
   public let intensity: ScanIntensity
+  public let mode: ScanMode
+  public var reusedItemCount: Int64
+  public var journalComplete: Bool
   public var itemCount: Int64
   public var logicalBytes: UInt64
   public var allocatedBytes: UInt64
@@ -285,6 +293,26 @@ public struct ScannerResult: Sendable, Equatable {
   public let bulkDirectoryCount: Int
   public let fallbackDirectoryCount: Int
   public let maximumDepth: Int
+  public let reusedItemCount: Int64
+  public let journalComplete: Bool
+
+  public init(
+    progress: ScanProgress,
+    cancelled: Bool,
+    bulkDirectoryCount: Int,
+    fallbackDirectoryCount: Int,
+    maximumDepth: Int,
+    reusedItemCount: Int64 = 0,
+    journalComplete: Bool = true
+  ) {
+    self.progress = progress
+    self.cancelled = cancelled
+    self.bulkDirectoryCount = bulkDirectoryCount
+    self.fallbackDirectoryCount = fallbackDirectoryCount
+    self.maximumDepth = maximumDepth
+    self.reusedItemCount = reusedItemCount
+    self.journalComplete = journalComplete
+  }
 }
 
 public struct DuplicateGroup: Identifiable, Codable, Sendable, Equatable {

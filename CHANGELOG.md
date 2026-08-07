@@ -2,6 +2,14 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.1.0 — 2026-08-07
+
+- Add a local incremental metadata index backed by SQLite and the public macOS FSEvents journal.
+- Reuse unchanged directory subtrees with stable item IDs instead of walking every descendant again.
+- Add explicit **Fast update current scan** and **Full rescan from scratch** actions to the toolbar.
+- Fall back to a full scan after app restart, dropped events, hard-link subtrees or changes during a scan; no private APFS parser is used.
+- Document the APFS/MFT decision and add an end-to-end incremental-reuse test.
+
 ## 1.0.10 — 2026-08-07
 
 - Add a persistent New scan menu to the main toolbar so starting a scan does not depend on the sidebar being visible.

@@ -107,6 +107,7 @@ struct ContentView: View {
               HStack {
                 Text(HumanFormat.size(scan.allocatedBytes))
                 Spacer()
+                Text(scan.mode == .incremental ? "Fast update" : "Full scan")
                 Text(scan.startedAt, style: .relative)
               }.font(.caption).foregroundStyle(.secondary)
             }
@@ -182,11 +183,21 @@ struct ContentView: View {
           Menu {
             Button("Scan Folder", action: model.chooseFolder)
             Button("Scan Full Disk", action: model.scanFullDisk)
+            if model.currentScan != nil {
+              Divider()
+              Button("Fast update current scan", action: { model.repeatCurrentScan(mode: .incremental) })
+              Button("Full rescan from scratch", action: { model.repeatCurrentScan(mode: .full) })
+            }
           } label: {
             Label("New scan", systemImage: "plus.magnifyingglass")
           }
           .help("Start a new scan")
           .menuStyle(.borderedButton)
+          if let reason = model.incrementalUnavailableReason, !reason.isEmpty {
+            Image(systemName: "exclamationmark.triangle")
+              .foregroundStyle(.orange)
+              .help(reason)
+          }
           Button(action: model.showLargestItems) {
             Label("Largest files", systemImage: "arrow.down.right.and.arrow.up.left")
           }

@@ -23,6 +23,7 @@ The app combines a directory outline, sortable file table and treemap. Known dat
 - The two latest successful snapshots per root, including added, removed and grown files.
 - Complete JSON, CSV and SQLite exports for the full scan, current filter or selected subtree.
 - A `Largest files` view jumps directly to the biggest files in the current snapshot.
+- Fast repeat scans reuse unchanged directory subtrees from the local index. The toolbar also has **Full rescan from scratch** when you need a fresh traversal.
 - Compact AI reports with configurable limits and full, basic or strict path privacy.
 - English and Russian interface, local custom rules and no telemetry.
 
@@ -60,6 +61,8 @@ macOS protects Mail, Messages, browser data and several other directories. To in
 When you choose a folder through **Scan Folder**, OpenDiskTree stores a macOS security-scoped bookmark for that folder and reuses it on the next launch. The first access still requires the normal macOS confirmation. Scanning the entire `/` volume is governed by the separate Full Disk Access setting; rebuilding an ad-hoc local copy can make macOS treat it as a new app identity and ask again.
 
 Balanced mode limits I/O pressure. Turbo mode uses larger batches and more parallel directory reads. Both modes read file metadata with the same native bulk request used for directory names, keep one transaction for the active scan, defer nonessential SQLite indexes until the scan finishes, and refresh the visible table at a controlled cadence so a large scan does not repeatedly sort the same root rows. Folder totals and safety labels are finalized with an indexed bottom-up rollup rather than repeated full-table passes. A full-disk scan stops at nested mounted volumes such as Simulator runtimes instead of walking the same operating-system data again. A cancelled scan stays marked partial and never replaces a successful comparison snapshot.
+
+After a successful full scan, OpenDiskTree keeps a local metadata index and listens to the public macOS FSEvents journal. A **Fast update current scan** re-enumerates changed branches and copies unchanged subtrees directly inside SQLite, preserving stable item IDs and totals. This is deliberately conservative: after a restart, dropped FSEvents, an incomplete snapshot or changes during the scan, the fast option is disabled and the app falls back to a full scan. There is no private APFS parser or undocumented filesystem access, so the app remains compatible with FileVault, APFS volume groups and future macOS updates.
 
 The app starts a separate quick overview while the exact scan is preparing. It lists the selected directory immediately using the same native bulk metadata request, shows sizes for entries that are files, labels folder totals as partial estimates, and never writes those provisional rows into the exact SQLite snapshot. The exact scan then enumerates every visible filesystem object and replaces the overview with real files, statuses and metadata. macOS does not expose a Windows-MFT equivalent for an exact, permission-aware disk tree, so a laptop with hundreds of thousands or millions of entries cannot be guaranteed to finish in a few seconds. The optimized path removes avoidable database/UI work; SSD speed, permissions and the number of files remain the limiting factors.
 

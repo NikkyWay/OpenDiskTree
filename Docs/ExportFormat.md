@@ -38,6 +38,8 @@ JSON items, CSV rows and SQLite `items` rows use the same meanings:
 
 JSON additionally contains `manifest`, `scan`, `volumes`, `errors`, `rules`, `duplicateGroups` and `items`. CSV is intentionally flat and has one header row. The SQLite export contains `scans`, `volumes`, `items`, `scan_errors`, `duplicate_groups` and `duplicate_members`, including foreign keys and indexes for parent, path, size, status and duplicate lookups.
 
+The `scan` object also records `mode` (`full` or `incremental`), `reusedItemCount` and `journalComplete`. These fields explain how much of the local index was reused; they never relax the cleanup safety rules.
+
 ## AI report
 
 `ai-report.json` is a bounded summary rather than a database dump. Its manifest records the requested scope and privacy mode. It contains scan context, size-accounting caveats, inaccessible paths, totals by status and extension, recent snapshot changes, duplicate groups and ranked files and folders.

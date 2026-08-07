@@ -97,6 +97,9 @@ private struct ExportScan: Encodable {
   let finishedAt: Date?
   let state: ScanState
   let intensity: ScanIntensity
+  let mode: ScanMode
+  let reusedItemCount: Int64
+  let journalComplete: Bool
   let itemCount: Int64
   let logicalBytes: UInt64
   let allocatedBytes: UInt64
@@ -111,6 +114,9 @@ private struct ExportScan: Encodable {
     finishedAt = scan.finishedAt
     state = scan.state
     intensity = scan.intensity
+    mode = scan.mode
+    reusedItemCount = scan.reusedItemCount
+    journalComplete = scan.journalComplete
     itemCount = scan.itemCount
     logicalBytes = scan.logicalBytes
     allocatedBytes = scan.allocatedBytes

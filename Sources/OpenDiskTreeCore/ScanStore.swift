@@ -116,6 +116,15 @@ private final class ISO8601FormatterBox: @unchecked Sendable {
   let value = ISO8601DateFormatter()
 }
 
+private struct ReuseStats {
+  let itemCount: Int64
+  let fileCount: Int64
+  let directoryCount: Int64
+  let logicalBytes: UInt64
+  let allocatedBytes: UInt64
+  let maximumDepth: Int
+}
+
 public actor ScanStore {
   // Formatter construction asks ICU to build a locale/time-zone model. Creating it for
   // every timestamp made metadata insertion disproportionately expensive on large scans.
@@ -140,10 +149,17 @@ public actor ScanStore {
     try Self.migrate(database)
   }
 
-  public func beginScan(rootURL: URL, intensity: ScanIntensity) throws -> ScanRecord {
+  public func beginScan(
+    rootURL: URL,
+    intensity: ScanIntensity,
+    mode: ScanMode = .full
+  ) throws -> ScanRecord {
     // These indexes are only needed for filtering and duplicate queries after a scan.
     // Maintaining them for every discovered file multiplies random SQLite writes.
-    try database.execute("DROP INDEX IF EXISTS items_path")
+    // Incremental reuse probes the previous snapshot by path for every
+    // candidate. Keep this index alive in that mode; dropping it would turn a
+    // fast lookup into a full million-row scan for each directory.
+    if mode == .full { try database.execute("DROP INDEX IF EXISTS items_path") }
     try database.execute("DROP INDEX IF EXISTS items_status")
     try database.execute("DROP INDEX IF EXISTS items_duplicate_candidates")
     try database.execute("DROP INDEX IF EXISTS items_scan_depth")
@@ -151,8 +167,8 @@ public actor ScanStore {
     let volumeName = values.volumeName ?? rootURL.lastPathComponent
     let now = Date()
     let sql = """
-      INSERT INTO scans(root_path, volume_name, volume_uuid, started_at, state, intensity)
-      VALUES(?, ?, ?, ?, ?, ?)
+      INSERT INTO scans(root_path, volume_name, volume_uuid, started_at, state, intensity, scan_mode)
+      VALUES(?, ?, ?, ?, ?, ?, ?)
       """
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
@@ -160,6 +176,7 @@ public actor ScanStore {
       [
         .text(rootURL.path), .text(volumeName), values.volumeUUIDString.map(SQLValue.text) ?? .null,
         .text(Self.dateString(now)), .text(ScanState.running.rawValue), .text(intensity.rawValue),
+        .text(mode.rawValue),
       ], to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     let id = sqlite3_last_insert_rowid(database.handle)
@@ -167,7 +184,8 @@ public actor ScanStore {
     activeStreamingScanID = id
     return ScanRecord(
       id: id, rootPath: rootURL.path, volumeName: volumeName, volumeUUID: values.volumeUUIDString,
-      startedAt: now, finishedAt: nil, state: .running, intensity: intensity,
+      startedAt: now, finishedAt: nil, state: .running, intensity: intensity, mode: mode,
+      reusedItemCount: 0, journalComplete: mode == .full,
       itemCount: 0, logicalBytes: 0, allocatedBytes: 0, inaccessibleCount: 0
     )
   }
@@ -278,7 +296,7 @@ public actor ScanStore {
       result.cancelled
       ? result.progress.allocatedBytes : (root?.allocatedBytes ?? result.progress.allocatedBytes)
     let sql = """
-      UPDATE scans SET finished_at=?, state=?, item_count=?, logical_bytes=?, allocated_bytes=?, inaccessible_count=?
+      UPDATE scans SET finished_at=?, state=?, item_count=?, logical_bytes=?, allocated_bytes=?, inaccessible_count=?, reused_item_count=?, journal_complete=?
       WHERE id=?
       """
     let statement = try database.prepare(sql)
@@ -289,7 +307,8 @@ public actor ScanStore {
         .integer(result.progress.files + result.progress.directories),
         .unsigned(logicalBytes),
         .unsigned(allocatedBytes),
-        .integer(result.progress.inaccessible), .integer(scanID),
+        .integer(result.progress.inaccessible), .integer(result.reusedItemCount),
+        .integer(result.journalComplete ? 1 : 0), .integer(scanID),
       ], to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     guard let scan = try fetchScan(scanID) else { throw StoreError.missingScan(scanID) }
@@ -340,6 +359,81 @@ public actor ScanStore {
   public func fetchItem(scanID: Int64, itemID: Int64) throws -> ScannedItem? {
     let sql = Self.itemSelect + " WHERE scan_id=? AND id=? LIMIT 1"
     return try queryItems(sql: sql, values: [.integer(scanID), .integer(itemID)]).first
+  }
+
+  public func latestCompletedScan(rootPath: String) throws -> ScanRecord? {
+    try queryScans(
+      whereClause: "WHERE root_path=? AND state='completed' ORDER BY id DESC",
+      values: [.text(rootPath)], limit: 1
+    ).first
+  }
+
+  public func maximumItemID(scanID: Int64) throws -> Int64 {
+    try scalarInt("SELECT COALESCE(MAX(id),1) FROM items WHERE scan_id=?", [.integer(scanID)])
+  }
+
+  /// Copies an unchanged directory's descendants from a previous snapshot.
+  /// IDs are intentionally preserved so parent references remain valid while
+  /// newly discovered entries use IDs above the previous snapshot's maximum.
+  public func reuseSubtree(
+    previousScanID: Int64,
+    newScanID: Int64,
+    candidate: ScannedItem,
+    changedPaths: Set<String>
+  ) throws -> ReusedSubtree? {
+    guard candidate.kind.canHaveChildren,
+      !changedPaths.contains(where: { pathIsEqualOrDescendant($0, of: candidate.path) })
+    else { return nil }
+    guard let previous = try queryItems(
+      sql: Self.itemSelect + " WHERE scan_id=? AND path=? LIMIT 1",
+      values: [.integer(previousScanID), .text(candidate.path)]
+    ).first,
+      previous.kind == candidate.kind,
+      previous.deviceID == candidate.deviceID,
+      previous.fileID == candidate.fileID,
+      previous.modifiedAt == candidate.modifiedAt
+    else { return nil }
+    let escaped = candidate.path.replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
+    let prefix = escaped + "/%"
+    let hasHardLinks = try scalarInt(
+      "SELECT COUNT(*) FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\' AND link_count>1",
+      [.integer(previousScanID), .text(prefix)]) > 0
+    guard !hasHardLinks else { return nil }
+    let statsSQL = """
+      SELECT COUNT(*),
+        SUM(CASE WHEN kind='file' THEN 1 ELSE 0 END),
+        SUM(CASE WHEN kind IN ('directory','package') THEN 1 ELSE 0 END),
+        COALESCE(SUM(CASE WHEN kind IN ('directory','package') THEN 0 ELSE own_logical_bytes END),0),
+        COALESCE(SUM(CASE WHEN kind IN ('directory','package') THEN 0 ELSE accounted_allocated_bytes END),0),
+        COALESCE(MAX(depth),?)
+      FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\'
+      """
+    let stats = try queryReuseStats(
+      sql: statsSQL,
+      values: [.integer(Int64(candidate.depth)), .integer(previousScanID), .text(prefix)]
+    )
+    guard stats.itemCount > 0 else { return nil }
+    let sql = """
+      INSERT INTO items(
+        id,scan_id,parent_id,path,name,depth,kind,extension,
+        own_logical_bytes,own_allocated_bytes,accounted_allocated_bytes,logical_bytes,allocated_bytes,
+        created_at,modified_at,device_id,file_id,link_count,is_hidden,is_package,
+        safety_status,rule_id,reason,confidence,source_application,is_protected_rule,
+        duplicate_group_id,is_deleted
+      ) SELECT id,?,parent_id,path,name,depth,kind,extension,
+        own_logical_bytes,own_allocated_bytes,accounted_allocated_bytes,logical_bytes,allocated_bytes,
+        created_at,modified_at,device_id,file_id,link_count,is_hidden,is_package,
+        safety_status,rule_id,reason,confidence,source_application,is_protected_rule,
+        duplicate_group_id,is_deleted
+      FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\'
+      """
+    try executeBound(sql, [.integer(newScanID), .integer(previousScanID), .text(prefix)])
+    return ReusedSubtree(
+      itemID: previous.id, itemCount: stats.itemCount, fileCount: stats.fileCount,
+      directoryCount: stats.directoryCount, logicalBytes: stats.logicalBytes,
+      allocatedBytes: stats.allocatedBytes, maximumDepth: stats.maximumDepth
+    )
   }
 
   public func fetchChildren(
@@ -837,10 +931,13 @@ public actor ScanStore {
         finished_at TEXT,
         state TEXT NOT NULL,
         intensity TEXT NOT NULL,
+        scan_mode TEXT NOT NULL DEFAULT 'full',
         item_count INTEGER NOT NULL DEFAULT 0,
         logical_bytes INTEGER NOT NULL DEFAULT 0,
         allocated_bytes INTEGER NOT NULL DEFAULT 0,
-        inaccessible_count INTEGER NOT NULL DEFAULT 0
+        inaccessible_count INTEGER NOT NULL DEFAULT 0,
+        reused_item_count INTEGER NOT NULL DEFAULT 0,
+        journal_complete INTEGER NOT NULL DEFAULT 1
       );
       CREATE TABLE IF NOT EXISTS items(
         id INTEGER NOT NULL,
@@ -948,6 +1045,12 @@ public actor ScanStore {
         PRAGMA foreign_keys=ON;
         """)
     }
+    if version < 3 {
+      try? database.execute("ALTER TABLE scans ADD COLUMN scan_mode TEXT NOT NULL DEFAULT 'full'")
+      try? database.execute("ALTER TABLE scans ADD COLUMN reused_item_count INTEGER NOT NULL DEFAULT 0")
+      try? database.execute("ALTER TABLE scans ADD COLUMN journal_complete INTEGER NOT NULL DEFAULT 1")
+      try database.execute("PRAGMA user_version=3")
+    }
   }
 
   private func append(filter: ItemFilter, clauses: inout [String], values: inout [SQLValue]) {
@@ -993,7 +1096,7 @@ public actor ScanStore {
     -> [ScanRecord]
   {
     let sql =
-      "SELECT id,root_path,volume_name,volume_uuid,started_at,finished_at,state,intensity,item_count,logical_bytes,allocated_bytes,inaccessible_count FROM scans \(whereClause) LIMIT ?"
+      "SELECT id,root_path,volume_name,volume_uuid,started_at,finished_at,state,intensity,scan_mode,item_count,logical_bytes,allocated_bytes,inaccessible_count,reused_item_count,journal_complete FROM scans \(whereClause) LIMIT ?"
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
     try database.bind(values + [.integer(Int64(limit))], to: statement, sql: sql)
@@ -1009,10 +1112,13 @@ public actor ScanStore {
           volumeName: Self.text(statement, 2) ?? "", volumeUUID: Self.text(statement, 3),
           startedAt: started, finishedAt: Self.date(Self.text(statement, 5)), state: state,
           intensity: intensity,
-          itemCount: sqlite3_column_int64(statement, 8),
-          logicalBytes: UInt64(max(0, sqlite3_column_int64(statement, 9))),
-          allocatedBytes: UInt64(max(0, sqlite3_column_int64(statement, 10))),
-          inaccessibleCount: sqlite3_column_int64(statement, 11)
+          mode: ScanMode(rawValue: Self.text(statement, 8) ?? "") ?? .full,
+          reusedItemCount: sqlite3_column_int64(statement, 13),
+          journalComplete: sqlite3_column_int(statement, 14) != 0,
+          itemCount: sqlite3_column_int64(statement, 9),
+          logicalBytes: UInt64(max(0, sqlite3_column_int64(statement, 10))),
+          allocatedBytes: UInt64(max(0, sqlite3_column_int64(statement, 11))),
+          inaccessibleCount: sqlite3_column_int64(statement, 12)
         ))
     }
     return scans
@@ -1052,6 +1158,23 @@ public actor ScanStore {
     defer { sqlite3_finalize(statement) }
     try database.bind(values, to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
+  }
+
+  private func queryReuseStats(sql: String, values: [SQLValue]) throws -> ReuseStats {
+    let statement = try database.prepare(sql)
+    defer { sqlite3_finalize(statement) }
+    try database.bind(values, to: statement, sql: sql)
+    guard sqlite3_step(statement) == SQLITE_ROW else {
+      return ReuseStats(itemCount: 0, fileCount: 0, directoryCount: 0, logicalBytes: 0, allocatedBytes: 0, maximumDepth: 0)
+    }
+    return ReuseStats(
+      itemCount: sqlite3_column_int64(statement, 0),
+      fileCount: sqlite3_column_int64(statement, 1),
+      directoryCount: sqlite3_column_int64(statement, 2),
+      logicalBytes: UInt64(max(0, sqlite3_column_int64(statement, 3))),
+      allocatedBytes: UInt64(max(0, sqlite3_column_int64(statement, 4))),
+      maximumDepth: Int(sqlite3_column_int64(statement, 5))
+    )
   }
 
   private func scalarInt(_ sql: String, _ values: [SQLValue]) throws -> Int64 {
@@ -1128,6 +1251,10 @@ public actor ScanStore {
     if let seconds = TimeInterval(string) { return Date(timeIntervalSince1970: seconds) }
     return iso8601Formatter.value.date(from: string)
   }
+}
+
+private func pathIsEqualOrDescendant(_ path: String, of root: String) -> Bool {
+  path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
 }
 
 extension Int64 {

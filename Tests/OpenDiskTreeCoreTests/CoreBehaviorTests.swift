@@ -196,6 +196,43 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   #expect(children.contains { $0.name == "nested" })
 }
 
+@Test func incrementalScanReusesUnchangedSubtree() async throws {
+  let workspace = try TestWorkspace()
+  defer { workspace.remove() }
+  let stable = workspace.url.appendingPathComponent("stable", isDirectory: true)
+  try FileManager.default.createDirectory(
+    at: stable.appendingPathComponent("nested"), withIntermediateDirectories: true)
+  try write(String(repeating: "stable", count: 400), to: stable.appendingPathComponent("data.bin"))
+  let databaseURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+    "OpenDiskTree-incremental-\(UUID().uuidString).sqlite")
+  defer { try? FileManager.default.removeItem(at: databaseURL) }
+  let (store, first) = try await scanFixture(workspace.url, databaseURL: databaseURL)
+  let second = try await store.beginScan(
+    rootURL: workspace.url, intensity: .balanced, mode: .incremental)
+  let root = try DiskScanner.makeRootItem(scanID: second.id, id: 1, url: workspace.url)
+  try await store.insert([root])
+  let previousMaximum = try await store.maximumItemID(scanID: first.id)
+  let scanner = DiskScanner()
+  let result = try await scanner.scan(
+    scanID: second.id,
+    rootItemID: 1,
+    options: ScanOptions(
+      rootURL: workspace.url, mode: .incremental, startingItemID: previousMaximum + 1),
+    onBatch: { items, _ in try await store.insert(items) },
+    onErrors: { errors in try await store.insert(errors: errors) },
+    onReuseCandidate: { candidate in
+      try await store.reuseSubtree(
+        previousScanID: first.id, newScanID: second.id, candidate: candidate, changedPaths: [])
+    }
+  )
+  let finished = try await store.finishScan(second.id, result: result)
+  #expect(result.reusedItemCount > 0)
+  #expect(finished.mode == .incremental)
+  #expect(finished.reusedItemCount == result.reusedItemCount)
+  #expect(finished.itemCount == first.itemCount)
+  #expect(finished.allocatedBytes == first.allocatedBytes)
+}
+
 @Test func duplicateFinderUsesContentNotOnlySize() async throws {
   let workspace = try TestWorkspace()
   defer { workspace.remove() }

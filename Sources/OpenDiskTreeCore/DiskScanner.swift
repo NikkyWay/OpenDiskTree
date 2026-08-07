@@ -35,12 +35,50 @@ public struct ScanOptions: Sendable {
   public let rootURL: URL
   public let intensity: ScanIntensity
   public let crossSelectedVolume: Bool
+  public let mode: ScanMode
+  public let startingItemID: Int64
 
-  public init(rootURL: URL, intensity: ScanIntensity = .balanced, crossSelectedVolume: Bool = false)
+  public init(
+    rootURL: URL,
+    intensity: ScanIntensity = .balanced,
+    crossSelectedVolume: Bool = false,
+    mode: ScanMode = .full,
+    startingItemID: Int64 = 2
+  )
   {
     self.rootURL = rootURL.standardizedFileURL
     self.intensity = intensity
     self.crossSelectedVolume = crossSelectedVolume
+    self.mode = mode
+    self.startingItemID = max(2, startingItemID)
+  }
+}
+
+public struct ReusedSubtree: Sendable, Equatable {
+  public let itemID: Int64
+  public let itemCount: Int64
+  public let fileCount: Int64
+  public let directoryCount: Int64
+  public let logicalBytes: UInt64
+  public let allocatedBytes: UInt64
+  public let maximumDepth: Int
+
+  public init(
+    itemID: Int64,
+    itemCount: Int64,
+    fileCount: Int64,
+    directoryCount: Int64,
+    logicalBytes: UInt64,
+    allocatedBytes: UInt64,
+    maximumDepth: Int
+  ) {
+    self.itemID = itemID
+    self.itemCount = itemCount
+    self.fileCount = fileCount
+    self.directoryCount = directoryCount
+    self.logicalBytes = logicalBytes
+    self.allocatedBytes = allocatedBytes
+    self.maximumDepth = maximumDepth
   }
 }
 
@@ -77,7 +115,9 @@ public final class DiskScanner: Sendable {
     options: ScanOptions,
     onBatch: @Sendable ([ScannedItem], ScanProgress) async throws -> Void,
     onErrors: @Sendable ([ScanErrorRecord]) async throws -> Void,
-    onProgress: @Sendable (ScanProgress) async -> Void = { _ in }
+    onProgress: @Sendable (ScanProgress) async -> Void = { _ in },
+    onReuseCandidate: @Sendable (ScannedItem) async throws -> ReusedSubtree? = { _ in nil },
+    onReuseSubtree: @Sendable (ReusedSubtree, ScannedItem) async throws -> Void = { _, _ in }
   ) async throws -> ScannerResult {
     let signpostState = scannerSignposter.beginInterval("Disk scan")
     defer { scannerSignposter.endInterval("Disk scan", signpostState) }
@@ -88,13 +128,14 @@ public final class DiskScanner: Sendable {
       PendingDirectory(id: rootItemID, path: rootPath, depth: 0, deviceID: rootStat.deviceID)
     ]
     var cursor = 0
-    var nextID = rootItemID + 1
+    var nextID = options.startingItemID
     var progress = ScanProgress(currentPath: rootPath)
     progress.directories = 1
     var linkedStorage = Set<FileIdentity>()
     var bulkCount = 0
     var fallbackCount = 0
     var maximumDepth = 0
+    var reusedItemCount: Int64 = 0
     // Larger transactions avoid SQLite fsync/prepare overhead on metadata-heavy scans.
     // The live refresh gate in AppModel keeps the first useful rows responsive.
     let batchLimit = options.intensity == .turbo ? 32_768 : 16_384
@@ -160,8 +201,6 @@ public final class DiskScanner: Sendable {
             ? "/\(entry.name)" : "\(outcome.directory.path)/\(entry.name)"
           if Self.shouldSkip(path: path, rootPath: rootPath) { continue }
 
-          let id = nextID
-          nextID += 1
           let depth = outcome.directory.depth + 1
           maximumDepth = max(maximumDepth, depth)
           let isContainer = entry.kind.canHaveChildren
@@ -173,8 +212,10 @@ public final class DiskScanner: Sendable {
             if !linkedStorage.insert(identity).inserted { accountedAllocated = 0 }
           }
           let classification = ruleEngine.classify(path: path, kind: entry.kind)
-          let item = ScannedItem(
-            id: id,
+          let provisionalID = nextID
+          nextID += 1
+          let provisionalItem = ScannedItem(
+            id: provisionalID,
             scanID: scanID,
             parentID: outcome.directory.id,
             path: path,
@@ -196,9 +237,47 @@ public final class DiskScanner: Sendable {
             isPackage: entry.isPackage,
             classification: classification
           )
+          let reuse = isContainer ? try await onReuseCandidate(provisionalItem) : nil
+          let id: Int64
+          let item: ScannedItem
+          if let reuse {
+            // Reused IDs keep parent references stable across snapshots. The store
+            // copies descendants only after this parent row has been committed.
+            id = reuse.itemID
+            item = ScannedItem(
+              id: id, scanID: provisionalItem.scanID, parentID: provisionalItem.parentID,
+              path: provisionalItem.path, name: provisionalItem.name, depth: provisionalItem.depth,
+              kind: provisionalItem.kind, fileExtension: provisionalItem.fileExtension,
+              ownLogicalBytes: provisionalItem.ownLogicalBytes,
+              ownAllocatedBytes: provisionalItem.ownAllocatedBytes,
+              accountedAllocatedBytes: provisionalItem.accountedAllocatedBytes,
+              logicalBytes: provisionalItem.logicalBytes, allocatedBytes: provisionalItem.allocatedBytes,
+              createdAt: provisionalItem.createdAt, modifiedAt: provisionalItem.modifiedAt,
+              deviceID: provisionalItem.deviceID, fileID: provisionalItem.fileID,
+              linkCount: provisionalItem.linkCount, isHidden: provisionalItem.isHidden,
+              isPackage: provisionalItem.isPackage, classification: provisionalItem.classification
+            )
+          } else {
+            id = provisionalID
+            item = provisionalItem
+          }
           bufferedItems.append(item)
           if isContainer {
             progress.directories += 1
+            if let reuse {
+              // Flush the parent first: the SQL clone uses its stable ID as the
+              // parent reference for every copied descendant.
+              try await onBatch(bufferedItems, progress)
+              bufferedItems.removeAll(keepingCapacity: true)
+              try await onReuseSubtree(reuse, item)
+              reusedItemCount += reuse.itemCount
+              progress.files += reuse.fileCount
+              progress.directories += reuse.directoryCount
+              progress.logicalBytes &+= reuse.logicalBytes
+              progress.allocatedBytes &+= reuse.allocatedBytes
+              maximumDepth = max(maximumDepth, reuse.maximumDepth)
+              continue
+            }
             if Self.shouldTraverseDirectory(
               rootDeviceID: rootStat.deviceID,
               entryDeviceID: entry.deviceID,
@@ -247,7 +326,9 @@ public final class DiskScanner: Sendable {
       cancelled: await control.isCancelled() || Task.isCancelled,
       bulkDirectoryCount: bulkCount,
       fallbackDirectoryCount: fallbackCount,
-      maximumDepth: maximumDepth
+      maximumDepth: maximumDepth,
+      reusedItemCount: reusedItemCount,
+      journalComplete: true
     )
   }
 

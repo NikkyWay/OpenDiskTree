@@ -54,6 +54,8 @@ final class AppModel: ObservableObject {
   @Published var pendingHistoryDeletion: ScanRecord?
   @Published var userRules: [CleanupRule] = []
   @Published var showRuleEditor = false
+  @Published var lastScanWasIncremental = false
+  @Published var incrementalUnavailableReason: String?
 
   @AppStorage("scanIntensity") private var intensityRaw = ScanIntensity.balanced.rawValue
   @AppStorage("strictDeletion") var strictDeletion = true
@@ -69,6 +71,8 @@ final class AppModel: ObservableObject {
   private var activeSecurityScopedURL: URL?
   private let bookmarkDefaultsKey = "securityScopedScanBookmarks"
   private let duplicateFinder = DuplicateFinder()
+  private let changeJournal = FSEventsChangeJournal()
+  private var journalBaselines = Set<String>()
 
   init() {
     do {
@@ -124,9 +128,14 @@ final class AppModel: ObservableObject {
     startScan(url: resolveSecurityScopedBookmark(for: selectedURL) ?? selectedURL)
   }
 
-  func scanFullDisk() { startScan(url: URL(fileURLWithPath: "/", isDirectory: true)) }
+  func scanFullDisk() { startScan(url: URL(fileURLWithPath: "/", isDirectory: true), mode: .full) }
 
-  func startScan(url: URL) {
+  func repeatCurrentScan(mode: ScanMode) {
+    guard let currentScan else { return }
+    startScan(url: URL(fileURLWithPath: currentScan.rootPath, isDirectory: true), mode: mode)
+  }
+
+  func startScan(url: URL, mode requestedMode: ScanMode? = nil) {
     guard !isScanning, let store else { return }
     if (try? url.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) == false {
       errorMessage =
@@ -135,6 +144,7 @@ final class AppModel: ObservableObject {
     }
     let securityScopedURL = url.startAccessingSecurityScopedResource() ? url : nil
     activeSecurityScopedURL = securityScopedURL
+    let rootPath = url.standardizedFileURL.path
     isScanning = true
     isPreliminary = false
     showingLargestItems = false
@@ -154,6 +164,25 @@ final class AppModel: ObservableObject {
         overviewTask = nil
       }
       do {
+        let previous = try await store.latestCompletedScan(rootPath: rootPath)
+        let journalSnapshot = changeJournal.snapshot(for: url)
+        let incrementalAllowed = previous != nil && journalBaselines.contains(rootPath)
+          && journalSnapshot.complete && previous?.journalComplete == true
+        let mode: ScanMode
+        if requestedMode == .full {
+          mode = .full
+        } else if incrementalAllowed {
+          mode = .incremental
+        } else {
+          mode = .full
+          if requestedMode == .incremental {
+            incrementalUnavailableReason = journalSnapshot.complete
+              ? "Быстрый повторный скан недоступен: непрерывный журнал ещё не создан. Выполните полный скан один раз."
+              : "Быстрый повторный скан недоступен: macOS сообщила о потерянных событиях."
+          }
+        }
+        let changedPaths = mode == .incremental ? journalSnapshot.paths : []
+        let journalGeneration = journalSnapshot.generation
         isPaused = false
         let pendingOverview = Task.detached(priority: .userInitiated) {
           await FastOverviewScanner.scan(rootURL: url)
@@ -171,7 +200,7 @@ final class AppModel: ObservableObject {
         let engine = RuleEngine(userRules: rules, allowProtectedOverrides: advancedRuleOverrides)
         let activeScanner = DiskScanner(ruleEngine: engine)
         scanner = activeScanner
-        let record = try await store.beginScan(rootURL: url, intensity: intensity)
+        let record = try await store.beginScan(rootURL: url, intensity: intensity, mode: mode)
         currentScan = record
         isPreliminary = false
         currentParentID = 1
@@ -183,10 +212,16 @@ final class AppModel: ObservableObject {
         directoryItems = [root]
         let liveRefreshGate = ScanLiveRefreshGate()
 
+        let startingID: Int64
+        if mode == .incremental, let previous {
+          startingID = try await store.maximumItemID(scanID: previous.id) + 1
+        } else {
+          startingID = 2
+        }
         let result = try await activeScanner.scan(
           scanID: record.id,
           rootItemID: 1,
-          options: ScanOptions(rootURL: url, intensity: intensity),
+          options: ScanOptions(rootURL: url, intensity: intensity, mode: mode, startingItemID: startingID),
           onBatch: { [weak self] batch, update in
             try await store.insert(batch)
             let liveItems: [ScannedItem]?
@@ -211,12 +246,37 @@ final class AppModel: ObservableObject {
               self?.progress = update
               if self?.isScanning == true { self?.statusMessage = "Scanning…" }
             }
+          },
+          onReuseCandidate: { candidate in
+            guard mode == .incremental, let previous else { return nil }
+            return try await store.reuseSubtree(
+              previousScanID: previous.id, newScanID: record.id,
+              candidate: candidate, changedPaths: changedPaths)
           }
         )
         statusMessage = "Finalizing scan…"
-        currentScan = try await store.finishScan(record.id, result: result)
+        // A full traversal is still a point-in-time snapshot. If macOS reports
+        // a filesystem event while it is running, do not use that snapshot as
+        // the baseline for a fast update; the next request must be full again.
+        let journalComplete = result.journalComplete
+          && changeJournal.generation() == journalGeneration
+        let finalResult = ScannerResult(
+          progress: result.progress, cancelled: result.cancelled,
+          bulkDirectoryCount: result.bulkDirectoryCount,
+          fallbackDirectoryCount: result.fallbackDirectoryCount,
+          maximumDepth: result.maximumDepth,
+          reusedItemCount: result.reusedItemCount,
+          journalComplete: journalComplete)
+        currentScan = try await store.finishScan(record.id, result: finalResult)
+        lastScanWasIncremental = mode == .incremental
+        if !finalResult.cancelled && (mode == .full || journalComplete) {
+          changeJournal.resetBaseline()
+          journalBaselines.insert(rootPath)
+        }
         statusMessage =
-          result.cancelled ? "Scan cancelled; partial results were kept." : "Scan complete."
+          finalResult.cancelled ? "Scan cancelled; partial results were kept."
+          : mode == .incremental ? "Fast update complete — unchanged folders were reused."
+          : "Scan complete."
         try await reloadResults()
         await loadRecentScans()
       } catch {
