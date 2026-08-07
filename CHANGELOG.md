@@ -2,6 +2,10 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.1.1 — 2026-08-07
+
+- Do not carry duplicate-group IDs between snapshots when copying unchanged subtrees; duplicate groups are always scoped to the snapshot that calculated them.
+
 ## 1.1.0 — 2026-08-07
 
 - Add a local incremental metadata index backed by SQLite and the public macOS FSEvents journal.

@@ -425,7 +425,7 @@ public actor ScanStore {
         own_logical_bytes,own_allocated_bytes,accounted_allocated_bytes,logical_bytes,allocated_bytes,
         created_at,modified_at,device_id,file_id,link_count,is_hidden,is_package,
         safety_status,rule_id,reason,confidence,source_application,is_protected_rule,
-        duplicate_group_id,is_deleted
+        NULL,is_deleted
       FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\'
       """
     try executeBound(sql, [.integer(newScanID), .integer(previousScanID), .text(prefix)])
