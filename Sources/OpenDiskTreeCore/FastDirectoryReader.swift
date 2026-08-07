@@ -15,11 +15,7 @@ public struct NativeDirectoryEntry: Sendable {
   public let isHidden: Bool
   public let isPackage: Bool
   public let isMountPoint: Bool
-
-  public var fileExtension: String? {
-    let value = URL(fileURLWithPath: name).pathExtension.lowercased()
-    return value.isEmpty ? nil : value
-  }
+  public let fileExtension: String?
 }
 
 public struct NativeDirectoryListing: Sendable {
@@ -73,7 +69,7 @@ public enum FastDirectoryReader {
       guard let pointer = raw.name else { continue }
       let name = String(cString: pointer)
       let kind = itemKind(mode: raw.mode, name: name)
-      let ext = URL(fileURLWithPath: name).pathExtension.lowercased()
+      let ext = pathExtension(of: name)
       entries.append(
         NativeDirectoryEntry(
           name: name,
@@ -89,7 +85,8 @@ public enum FastDirectoryReader {
           linkCount: raw.link_count,
           isHidden: raw.is_hidden != 0,
           isPackage: packageExtensions.contains(ext) && kind == .directory,
-          isMountPoint: raw.is_mount_point != 0
+          isMountPoint: raw.is_mount_point != 0,
+          fileExtension: ext.isEmpty ? nil : ext
         ))
     }
     return NativeDirectoryListing(entries: entries, usedBulkAPI: listing.used_bulk_api != 0)
@@ -102,5 +99,14 @@ public enum FastDirectoryReader {
     case UInt32(S_IFLNK): .symbolicLink
     default: .other
     }
+  }
+
+  /// URL path parsing is surprisingly expensive when performed millions of times.
+  /// Directory entries are already plain names, so a byte-free String scan is enough.
+  private static func pathExtension(of name: String) -> String {
+    guard let dot = name.lastIndex(of: "."), dot != name.startIndex,
+      dot < name.index(before: name.endIndex)
+    else { return "" }
+    return String(name[name.index(after: dot)...]).lowercased()
   }
 }

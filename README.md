@@ -44,7 +44,7 @@ open dist/OpenDiskTree.app
 `build-app.sh` creates an ad-hoc signed application. Release ZIP, DMG and SHA-256 manifest are built with:
 
 ```sh
-./Scripts/release.sh 1.0.2
+./Scripts/release.sh 1.0.3
 ```
 
 The command creates `OpenDiskTree-arm64.dmg`, `OpenDiskTree-arm64.zip` and `SHA256SUMS.txt`. GitHub release artifacts are unsigned. On first launch, macOS may require **Control-click → Open**. Developer ID signing and notarization can be added later without changing the application targets.
@@ -55,7 +55,11 @@ Use **Scan Folder** for a normal directory or external local disk. **Scan Full D
 
 macOS protects Mail, Messages, browser data and several other directories. To include them, open **Full Disk Access…**, enable OpenDiskTree in System Settings, quit the app and launch it again. The scanner never installs a privileged helper; paths that remain inaccessible are counted and exported as scan errors.
 
-Balanced mode limits I/O pressure. Turbo mode uses larger batches and more parallel directory reads. Both modes read file metadata with the same native bulk request used for directory names, stream results into SQLite, keep the UI responsive and support pause or cancellation. A full-disk scan stops at nested mounted volumes such as Simulator runtimes instead of walking the same operating-system data again. A cancelled scan stays marked partial and never replaces a successful comparison snapshot.
+When you choose a folder through **Scan Folder**, OpenDiskTree stores a macOS security-scoped bookmark for that folder and reuses it on the next launch. The first access still requires the normal macOS confirmation. Scanning the entire `/` volume is governed by the separate Full Disk Access setting; rebuilding an ad-hoc local copy can make macOS treat it as a new app identity and ask again.
+
+Balanced mode limits I/O pressure. Turbo mode uses larger batches and more parallel directory reads. Both modes read file metadata with the same native bulk request used for directory names, stream results into SQLite, and refresh the visible table at a controlled cadence so a large scan does not repeatedly sort the same root rows. A full-disk scan stops at nested mounted volumes such as Simulator runtimes instead of walking the same operating-system data again. A cancelled scan stays marked partial and never replaces a successful comparison snapshot.
+
+The app can show the first useful rows while a scan is still running, but a complete scan must still enumerate every visible filesystem object. macOS does not expose a Windows-MFT equivalent for an exact, permission-aware disk tree, so a laptop with hundreds of thousands or millions of entries cannot be guaranteed to finish in a few seconds. The optimized path removes avoidable database/UI work; SSD speed, permissions and the number of files remain the limiting factors.
 
 While a scan is running, the status bar shows elapsed time, processing rate and the current path. Folder totals and the treemap settle after the final aggregation pass; until then the interface labels them as calculating rather than displaying a misleading zero.
 

@@ -2,6 +2,13 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.0.3 — 2026-08-07
+
+- Removed repeated root-table sorting from the scan hot path; live rows refresh at a controlled cadence while every metadata batch is still persisted immediately.
+- Increased scanner transaction sizes and cached each entry's extension during native metadata conversion.
+- A full-disk scan now spends its time on filesystem enumeration instead of redrawing the same SQLite result hundreds of times.
+- Selected folders now persist macOS security-scoped bookmarks and keep access open for the scan, so reopening the same folder does not ask for permission again.
+
 ## 1.0.2 — 2026-07-19
 
 - Read names, sizes, timestamps, file identity and link counts in the same native metadata batch instead of issuing a separate `stat` call for every item.

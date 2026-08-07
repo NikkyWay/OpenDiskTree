@@ -92,7 +92,16 @@ private final class SQLiteConnection {
   }
 }
 
+private final class ISO8601FormatterBox: @unchecked Sendable {
+  let value = ISO8601DateFormatter()
+}
+
 public actor ScanStore {
+  // Formatter construction asks ICU to build a locale/time-zone model. Creating it for
+  // every timestamp made metadata insertion disproportionately expensive on large scans.
+  // ScanStore is an actor, so this formatter is only accessed serially.
+  private static let iso8601Formatter = ISO8601FormatterBox()
+
   public nonisolated let databaseURL: URL
   private let database: SQLiteConnection
 
@@ -1006,12 +1015,12 @@ public actor ScanStore {
   }
 
   private static func dateString(_ date: Date) -> String {
-    ISO8601DateFormatter().string(from: date)
+    iso8601Formatter.value.string(from: date)
   }
 
   private static func date(_ string: String?) -> Date? {
     guard let string else { return nil }
-    return ISO8601DateFormatter().date(from: string)
+    return iso8601Formatter.value.date(from: string)
   }
 }
 

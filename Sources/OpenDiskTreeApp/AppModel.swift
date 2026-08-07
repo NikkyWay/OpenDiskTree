@@ -3,6 +3,22 @@ import Foundation
 import OpenDiskTreeCore
 import SwiftUI
 
+private actor ScanLiveRefreshGate {
+  private var lastRefresh = Date.distantPast
+  private let interval: TimeInterval
+
+  init(interval: TimeInterval = 0.75) {
+    self.interval = interval
+  }
+
+  func shouldRefresh() -> Bool {
+    let now = Date()
+    guard now.timeIntervalSince(lastRefresh) >= interval else { return false }
+    lastRefresh = now
+    return true
+  }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
   @Published var recentScans: [ScanRecord] = []
@@ -47,6 +63,8 @@ final class AppModel: ObservableObject {
   private(set) var store: ScanStore?
   private var scanner: DiskScanner?
   private var scanTask: Task<Void, Never>?
+  private var activeSecurityScopedURL: URL?
+  private let bookmarkDefaultsKey = "securityScopedScanBookmarks"
   private let duplicateFinder = DuplicateFinder()
 
   init() {
@@ -98,7 +116,9 @@ final class AppModel: ObservableObject {
     panel.canChooseFiles = false
     panel.allowsMultipleSelection = false
     panel.canCreateDirectories = false
-    if panel.runModal() == .OK, let url = panel.url { startScan(url: url) }
+    guard panel.runModal() == .OK, let selectedURL = panel.url else { return }
+    saveSecurityScopedBookmark(for: selectedURL)
+    startScan(url: resolveSecurityScopedBookmark(for: selectedURL) ?? selectedURL)
   }
 
   func scanFullDisk() { startScan(url: URL(fileURLWithPath: "/", isDirectory: true)) }
@@ -110,7 +130,13 @@ final class AppModel: ObservableObject {
         "Network volumes are not supported. Choose a folder on a local or directly attached disk."
       return
     }
+    let securityScopedURL = url.startAccessingSecurityScopedResource() ? url : nil
+    activeSecurityScopedURL = securityScopedURL
     scanTask = Task {
+      defer {
+        if let securityScopedURL { securityScopedURL.stopAccessingSecurityScopedResource() }
+        activeSecurityScopedURL = nil
+      }
       do {
         isScanning = true
         isPaused = false
@@ -130,6 +156,7 @@ final class AppModel: ObservableObject {
         try await store.insert([root])
         items = []
         directoryItems = [root]
+        let liveRefreshGate = ScanLiveRefreshGate()
 
         let result = try await activeScanner.scan(
           scanID: record.id,
@@ -137,13 +164,19 @@ final class AppModel: ObservableObject {
           options: ScanOptions(rootURL: url, intensity: intensity),
           onBatch: { [weak self] batch, update in
             try await store.insert(batch)
-            let liveItems = try await store.fetchChildren(
-              scanID: record.id, parentID: 1, sort: .allocatedSize)
+            let liveItems: [ScannedItem]?
+            if await liveRefreshGate.shouldRefresh() {
+              liveItems = try await store.fetchChildren(
+                scanID: record.id, parentID: 1, sort: .allocatedSize)
+            } else {
+              liveItems = nil
+            }
             await MainActor.run {
               self?.progress = update
               self?.statusMessage = self?.isPaused == true ? "Scan paused." : "Scanning…"
               guard self?.currentScan?.id == record.id else { return }
-              if self?.currentParentID == 1 { self?.items = liveItems }
+              guard let liveItems, self?.currentParentID == 1 else { return }
+              self?.items = liveItems
               self?.directoryItems = [root] + liveItems.filter(\.kind.canHaveChildren)
             }
           },
@@ -165,6 +198,29 @@ final class AppModel: ObservableObject {
       isPaused = false
       scanner = nil
     }
+  }
+
+  private func saveSecurityScopedBookmark(for url: URL) {
+    guard let data = try? url.bookmarkData(
+      options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    else { return }
+    var bookmarks = UserDefaults.standard.dictionary(forKey: bookmarkDefaultsKey) as? [String: Data] ?? [:]
+    bookmarks[url.standardizedFileURL.path] = data
+    UserDefaults.standard.set(bookmarks, forKey: bookmarkDefaultsKey)
+  }
+
+  private func resolveSecurityScopedBookmark(for url: URL) -> URL? {
+    let key = url.standardizedFileURL.path
+    guard let bookmarks = UserDefaults.standard.dictionary(forKey: bookmarkDefaultsKey) as? [String: Data],
+      let data = bookmarks[key]
+    else { return nil }
+    var isStale = false
+    guard let resolved = try? URL(
+      resolvingBookmarkData: data, options: [.withSecurityScope], relativeTo: nil,
+      bookmarkDataIsStale: &isStale)
+    else { return nil }
+    if isStale { saveSecurityScopedBookmark(for: resolved) }
+    return resolved
   }
 
   func togglePause() {

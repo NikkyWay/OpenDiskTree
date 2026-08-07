@@ -94,10 +94,14 @@ public final class DiskScanner: Sendable {
     var bulkCount = 0
     var fallbackCount = 0
     var maximumDepth = 0
-    let batchLimit = options.intensity == .turbo ? 8_192 : 4_096
+    // Larger transactions avoid SQLite fsync/prepare overhead on metadata-heavy scans.
+    // The live refresh gate in AppModel keeps the first useful rows responsive.
+    let batchLimit = options.intensity == .turbo ? 32_768 : 16_384
     var bufferedItems: [ScannedItem] = []
     bufferedItems.reserveCapacity(batchLimit)
     var lastFlush = Date()
+    let minimumFlushCount = options.intensity == .turbo ? 8_192 : 4_096
+    let flushInterval: TimeInterval = 0.75
 
     while cursor < queue.count {
       guard await control.checkpoint(), !Task.isCancelled else { break }
@@ -216,7 +220,9 @@ public final class DiskScanner: Sendable {
         }
       }
       if !errors.isEmpty { try await onErrors(errors) }
-      if !bufferedItems.isEmpty && Date().timeIntervalSince(lastFlush) >= 0.25 {
+      if bufferedItems.count >= minimumFlushCount
+        && Date().timeIntervalSince(lastFlush) >= flushInterval
+      {
         try await onBatch(bufferedItems, progress)
         bufferedItems.removeAll(keepingCapacity: true)
         lastFlush = Date()
