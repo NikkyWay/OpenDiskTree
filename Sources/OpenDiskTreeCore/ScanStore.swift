@@ -393,10 +393,6 @@ public actor ScanStore {
 
   private func ensureQueryIndexes() throws {
     try database.execute("CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path)")
-    try database.execute("CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status)")
-    try database.execute(
-      "CREATE INDEX IF NOT EXISTS items_duplicate_candidates ON items(scan_id,logical_bytes) WHERE kind='file'"
-    )
   }
 
   public func fetchScan(_ id: Int64) throws -> ScanRecord? {
@@ -1046,6 +1042,7 @@ public actor ScanStore {
   private static func migrate(_ database: SQLiteConnection) throws {
     try database.execute(
       """
+      PRAGMA page_size=32768;
       PRAGMA journal_mode=WAL;
       PRAGMA wal_autocheckpoint=0;
       PRAGMA synchronous=NORMAL;
@@ -1100,13 +1097,13 @@ public actor ScanStore {
         duplicate_group_id INTEGER,
         is_deleted INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(scan_id,id)
-      );
-      CREATE INDEX IF NOT EXISTS items_parent ON items(scan_id,parent_id);
+      ) WITHOUT ROWID;
+      DROP INDEX IF EXISTS items_parent;
+      DROP INDEX IF EXISTS items_status;
+      DROP INDEX IF EXISTS items_duplicate_candidates;
       CREATE INDEX IF NOT EXISTS items_parent_size ON items(scan_id,parent_id,allocated_bytes DESC);
       CREATE INDEX IF NOT EXISTS items_size ON items(scan_id,allocated_bytes DESC);
       CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path);
-      CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status);
-      CREATE INDEX IF NOT EXISTS items_duplicate_candidates ON items(scan_id,logical_bytes) WHERE kind='file';
       CREATE TABLE IF NOT EXISTS scan_errors(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,

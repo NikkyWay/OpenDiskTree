@@ -11,12 +11,14 @@ All notable changes to OpenDiskTree are recorded here.
 - Publish a completed snapshot before pruning old history; multi-million-row cascade deletion now runs transactionally on a background WAL connection.
 - Disable foreground WAL auto-checkpoints during a scan; checkpoint and truncate the scan log during background retention maintenance after results are visible.
 - Give SQLite a bounded metadata page cache and memory-map read-only index pages, avoiding repeated SSD reads while large retained B-trees are updated.
+- Remove three write-heavy redundant or cold-path item indexes; parent-size navigation, largest-item sorting and path lookup remain indexed.
+- Create new item stores with 32 KiB pages and `WITHOUT ROWID`, eliminating the unused hidden rowid B-tree behind the composite item identity.
 - Reclaim abandoned `running` snapshots and obsolete partial snapshots left by terminated older builds during background retention cleanup.
 - Compute directory sizes and safety states in one in-memory bottom-up pass, replacing one SQL table scan per path depth during finalization.
 - Reuse the previous directory rollup during incremental scans, avoiding the old full-table aggregation after unchanged subtrees are copied.
 - Compile cleanup-rule paths once and classify suffix rules using the extension already returned by the native reader.
 - Parse `getattrlistbulk` records from their returned attribute bitmap so optional metadata cannot misalign the rest of a record.
-- Add a reproducible real-filesystem benchmark. On the development Mac, a 1.96-million-item `/` traversal took 19.8 seconds and a clean SQLite snapshot including finalization took 27.3 seconds, down from 431 seconds in the previous installed build.
+- Add a reproducible real-filesystem benchmark. On the development Mac, a 1.95-million-item `/` traversal plus SQLite write took 19.9 seconds and the finalized snapshot took 22.3 seconds, down from 431 seconds in the previous installed build.
 
 ## 1.2.3 — 2026-08-09
 
