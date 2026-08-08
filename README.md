@@ -22,6 +22,7 @@ The app combines a directory outline, sortable file table and treemap. Known dat
 - On-demand duplicate detection using size, sample hashes and full SHA-256 verification.
 - The two latest successful snapshots per root, including added, removed and grown files.
 - Complete JSON, CSV and SQLite exports for the full scan, current filter or selected subtree.
+- Large exports stream with keyset pagination; SQLite output is a relational snapshot with foreign keys and indexes.
 - A `Largest files` view jumps directly to the biggest files in the current snapshot.
 - Fast repeat scans reuse unchanged directory subtrees from the local index. The toolbar also has **Full rescan from scratch** when you need a fresh traversal.
 - The folder outline expands lazily: opening a deep directory reads only that branch, so a huge historical snapshot does not need to decode its entire tree at launch.

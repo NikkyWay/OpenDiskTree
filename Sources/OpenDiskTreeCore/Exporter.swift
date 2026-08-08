@@ -399,7 +399,7 @@ public actor ScanExporter {
     let rules = RuleEngine.builtInRules + (try await store.loadUserRules())
     for rule in rules {
       let ruleJSON = String(decoding: try Self.encoder().encode(rule), as: UTF8.self)
-      try Self.sqliteExec(handle, "INSERT INTO rules(id,json) VALUES(?,?)", [.text(rule.id), .text(ruleJSON)])
+      try Self.sqliteExec(handle, "INSERT OR REPLACE INTO rules(id,json) VALUES(?,?)", [.text(rule.id), .text(ruleJSON)])
     }
     try Self.sqliteExec(handle, "BEGIN", [])
     let itemSQL = "INSERT INTO items(scan_id,id,parent_id,path,name,depth,kind,extension,logical_bytes,allocated_bytes,created_at,modified_at,link_count,is_hidden,is_package,safety_status,rule_id,reason,confidence,source_application,duplicate_group_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
