@@ -363,6 +363,9 @@ public actor ScanStore {
         try connection.execute(
           "DELETE FROM cleanup_actions WHERE scan_id NOT IN (SELECT id FROM scans)")
         try connection.execute("COMMIT")
+        // Keep checkpoint I/O off the foreground scan connection. Once old
+        // snapshots are gone, collapse the WAL while the UI is already usable.
+        try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
       } catch {
         try? connection.execute("ROLLBACK")
         throw error
@@ -1042,6 +1045,7 @@ public actor ScanStore {
     try database.execute(
       """
       PRAGMA journal_mode=WAL;
+      PRAGMA wal_autocheckpoint=0;
       PRAGMA synchronous=NORMAL;
       PRAGMA foreign_keys=ON;
       PRAGMA temp_store=MEMORY;
