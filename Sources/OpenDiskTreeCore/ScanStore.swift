@@ -154,15 +154,10 @@ public actor ScanStore {
     intensity: ScanIntensity,
     mode: ScanMode = .full
   ) throws -> ScanRecord {
-    // These indexes are only needed for filtering and duplicate queries after a scan.
-    // Maintaining them for every discovered file multiplies random SQLite writes.
-    // Incremental reuse probes the previous snapshot by path for every
-    // candidate. Keep this index alive in that mode; dropping it would turn a
-    // fast lookup into a full million-row scan for each directory.
-    if mode == .full { try database.execute("DROP INDEX IF EXISTS items_path") }
-    try database.execute("DROP INDEX IF EXISTS items_status")
-    try database.execute("DROP INDEX IF EXISTS items_duplicate_candidates")
-    try database.execute("DROP INDEX IF EXISTS items_scan_depth")
+    // Query indexes cover every retained snapshot. Dropping them for one new
+    // scan made SQLite rebuild several million historical rows before results
+    // could be shown. The ordered writer pipeline makes maintaining them during
+    // insertion cheaper than a global drop/recreate cycle.
     let values = try rootURL.resourceValues(forKeys: [.volumeNameKey, .volumeUUIDStringKey])
     let volumeName = values.volumeName ?? rootURL.lastPathComponent
     let now = Date()
@@ -289,7 +284,6 @@ public actor ScanStore {
         try applyDirectoryRollups(scanID: scanID, rollups: result.directoryRollups)
       }
     }
-    try rebuildDeferredIndexes()
     let state: ScanState = result.cancelled ? .cancelled : .completed
     let finished = Date()
     let root = try fetchItem(scanID: scanID, itemID: rootItemID)
@@ -317,6 +311,7 @@ public actor ScanStore {
     try database.stepDone(statement, sql: sql)
     guard let scan = try fetchScan(scanID) else { throw StoreError.missingScan(scanID) }
     if state == .completed { try pruneCompletedHistory(rootPath: scan.rootPath, keeping: 2) }
+    try ensureQueryIndexes()
     if activeStreamingScanID == scanID {
       try database.execute("COMMIT")
       activeStreamingScanID = nil
@@ -337,10 +332,10 @@ public actor ScanStore {
       to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     try insert(errors: [ScanErrorRecord(scanID: scanID, path: "", code: EIO, message: message)])
-    try? rebuildDeferredIndexes()
+    try? ensureQueryIndexes()
   }
 
-  private func rebuildDeferredIndexes() throws {
+  private func ensureQueryIndexes() throws {
     try database.execute("CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path)")
     try database.execute("CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status)")
     try database.execute(
