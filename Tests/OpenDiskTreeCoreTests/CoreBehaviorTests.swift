@@ -382,6 +382,11 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
     try await store.changes(scanID: second.id).contains {
       $0.kind == .grown && $0.path.hasSuffix("one.bin")
     })
+
+  try await store.pruneCompletedHistoryInBackground(rootPath: root.path, keeping: 1)
+  #expect(try await store.fetchScan(first.id) == nil)
+  #expect(try await store.fetchScan(second.id) != nil)
+  #expect(try await store.duplicateGroups(scanID: first.id).isEmpty)
 }
 
 @Test func trashedRowsAreRemovedFromStoredTotals() async throws {

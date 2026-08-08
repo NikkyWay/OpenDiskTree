@@ -8,6 +8,8 @@ All notable changes to OpenDiskTree are recorded here.
 - Raise balanced and turbo metadata concurrency for APFS while keeping the worker count bounded.
 - Pipeline SQLite writes behind the scanner with ordered backpressure instead of stopping directory discovery for every transaction batch.
 - Keep global query indexes in place across snapshots, avoiding a full retained-history index rebuild before and after every scan.
+- Publish a completed snapshot before pruning old history; multi-million-row cascade deletion now runs transactionally on a background WAL connection.
+- Reclaim abandoned `running` snapshots and obsolete partial snapshots left by terminated older builds during background retention cleanup.
 - Compute directory sizes and safety states in one in-memory bottom-up pass, replacing one SQL table scan per path depth during finalization.
 - Reuse the previous directory rollup during incremental scans, avoiding the old full-table aggregation after unchanged subtrees are copied.
 - Compile cleanup-rule paths once and classify suffix rules using the extension already returned by the native reader.

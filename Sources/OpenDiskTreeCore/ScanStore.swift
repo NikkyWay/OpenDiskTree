@@ -310,13 +310,64 @@ public actor ScanStore {
       ], to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     guard let scan = try fetchScan(scanID) else { throw StoreError.missingScan(scanID) }
-    if state == .completed { try pruneCompletedHistory(rootPath: scan.rootPath, keeping: 2) }
     try ensureQueryIndexes()
     if activeStreamingScanID == scanID {
       try database.execute("COMMIT")
       activeStreamingScanID = nil
     }
     return scan
+  }
+
+  /// Prunes old successful snapshots on a separate SQLite connection. Large
+  /// cascade deletes update every query index and must not keep a completed
+  /// scan in the UI's Finalizing state. WAL lets normal result reads continue
+  /// while this background writer removes the old snapshot transactionally.
+  public nonisolated func pruneCompletedHistoryInBackground(
+    rootPath: String,
+    keeping count: Int = 2
+  ) async throws {
+    let databaseURL = self.databaseURL
+    try await Task.detached(priority: .background) {
+      let connection = try SQLiteConnection(url: databaseURL)
+      try connection.execute("PRAGMA foreign_keys=ON")
+      try connection.execute("PRAGMA busy_timeout=30000")
+      try connection.execute("BEGIN IMMEDIATE")
+      do {
+        // A new process cannot resume a transaction owned by a previous app
+        // process. Remove those abandoned snapshots, plus obsolete partial
+        // snapshots that already have a newer successful replacement.
+        try connection.execute("DELETE FROM scans WHERE state='running'")
+        try connection.execute(
+          """
+          DELETE FROM scans AS candidate
+          WHERE candidate.state IN ('cancelled','failed') AND EXISTS (
+            SELECT 1 FROM scans AS newer
+            WHERE newer.root_path=candidate.root_path
+              AND newer.state='completed' AND newer.id>candidate.id
+          )
+          """)
+        let sql = """
+          DELETE FROM scans
+          WHERE root_path=? AND state='completed' AND id NOT IN (
+            SELECT id FROM scans WHERE root_path=? AND state='completed' ORDER BY id DESC LIMIT ?
+          )
+          """
+        let statement = try connection.prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        try connection.bind(
+          [.text(rootPath), .text(rootPath), .integer(Int64(max(1, count)))],
+          to: statement,
+          sql: sql
+        )
+        try connection.stepDone(statement, sql: sql)
+        try connection.execute(
+          "DELETE FROM cleanup_actions WHERE scan_id NOT IN (SELECT id FROM scans)")
+        try connection.execute("COMMIT")
+      } catch {
+        try? connection.execute("ROLLBACK")
+        throw error
+      }
+    }.value
   }
 
   public func failScan(_ scanID: Int64, message: String) throws {
@@ -1259,17 +1310,6 @@ public actor ScanStore {
     try database.bind(values, to: statement, sql: sql)
     guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
     return sqlite3_column_int64(statement, 0)
-  }
-
-  private func pruneCompletedHistory(rootPath: String, keeping count: Int) throws {
-    try executeBound(
-      """
-      DELETE FROM scans
-      WHERE root_path=? AND state='completed' AND id NOT IN (
-        SELECT id FROM scans WHERE root_path=? AND state='completed' ORDER BY id DESC LIMIT ?
-      )
-      """, [.text(rootPath), .text(rootPath), .integer(Int64(count))])
-    try database.execute("DELETE FROM cleanup_actions WHERE scan_id NOT IN (SELECT id FROM scans)")
   }
 
   private static let itemSelect = """

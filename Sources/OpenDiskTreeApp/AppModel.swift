@@ -293,6 +293,12 @@ final class AppModel: ObservableObject {
             : "Scan complete."
         try await reloadResults()
         await loadRecentScans()
+        if !finalResult.cancelled {
+          Task {
+            try? await store.pruneCompletedHistoryInBackground(rootPath: rootPath)
+            await loadRecentScans()
+          }
+        }
       } catch {
         if let id = currentScan?.id {
           try? await store.failScan(id, message: error.localizedDescription)
