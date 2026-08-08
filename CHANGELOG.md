@@ -2,6 +2,10 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.2.3 — 2026-08-09
+
+- Make SQLite rule export resilient when a user rule intentionally uses the same ID as a built-in rule.
+
 ## 1.2.2 — 2026-08-09
 
 - Show export progress in the toolbar and allow cancelling a large export without leaving a partial destination file.
