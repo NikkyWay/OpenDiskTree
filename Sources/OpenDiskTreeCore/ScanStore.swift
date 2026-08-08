@@ -283,7 +283,11 @@ public actor ScanStore {
     -> ScanRecord
   {
     if !result.cancelled {
-      try aggregateDirectories(scanID: scanID, maximumDepth: result.maximumDepth)
+      if result.directoryRollups.isEmpty {
+        try aggregateDirectories(scanID: scanID, maximumDepth: result.maximumDepth)
+      } else {
+        try applyDirectoryRollups(scanID: scanID, rollups: result.directoryRollups)
+      }
     }
     try rebuildDeferredIndexes()
     let state: ScanState = result.cancelled ? .cancelled : .completed
@@ -340,7 +344,8 @@ public actor ScanStore {
     try database.execute("CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path)")
     try database.execute("CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status)")
     try database.execute(
-      "CREATE INDEX IF NOT EXISTS items_duplicate_candidates ON items(scan_id,logical_bytes) WHERE kind='file'")
+      "CREATE INDEX IF NOT EXISTS items_duplicate_candidates ON items(scan_id,logical_bytes) WHERE kind='file'"
+    )
   }
 
   public func fetchScan(_ id: Int64) throws -> ScanRecord? {
@@ -384,10 +389,11 @@ public actor ScanStore {
     guard candidate.kind.canHaveChildren,
       !changedPaths.contains(where: { pathIsEqualOrDescendant($0, of: candidate.path) })
     else { return nil }
-    guard let previous = try queryItems(
-      sql: Self.itemSelect + " WHERE scan_id=? AND path=? LIMIT 1",
-      values: [.integer(previousScanID), .text(candidate.path)]
-    ).first,
+    guard
+      let previous = try queryItems(
+        sql: Self.itemSelect + " WHERE scan_id=? AND path=? LIMIT 1",
+        values: [.integer(previousScanID), .text(candidate.path)]
+      ).first,
       previous.kind == candidate.kind,
       previous.deviceID == candidate.deviceID,
       previous.fileID == candidate.fileID,
@@ -396,9 +402,10 @@ public actor ScanStore {
     let escaped = candidate.path.replacingOccurrences(of: "\\", with: "\\\\")
       .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
     let prefix = escaped + "/%"
-    let hasHardLinks = try scalarInt(
-      "SELECT COUNT(*) FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\' AND link_count>1",
-      [.integer(previousScanID), .text(prefix)]) > 0
+    let hasHardLinks =
+      try scalarInt(
+        "SELECT COUNT(*) FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\' AND link_count>1",
+        [.integer(previousScanID), .text(prefix)]) > 0
     guard !hasHardLinks else { return nil }
     let statsSQL = """
       SELECT COUNT(*),
@@ -432,7 +439,8 @@ public actor ScanStore {
     return ReusedSubtree(
       itemID: previous.id, itemCount: stats.itemCount, fileCount: stats.fileCount,
       directoryCount: stats.directoryCount, logicalBytes: stats.logicalBytes,
-      allocatedBytes: stats.allocatedBytes, maximumDepth: stats.maximumDepth
+      allocatedBytes: stats.allocatedBytes, maximumDepth: stats.maximumDepth,
+      classification: previous.classification
     )
   }
 
@@ -574,7 +582,8 @@ public actor ScanStore {
         append(filter: filter, clauses: &clauses, values: &values)
       }
       values.append(.integer(Int64(limit)))
-      let sql = Self.itemSelect
+      let sql =
+        Self.itemSelect
         + " WHERE \(clauses.joined(separator: " AND ")) ORDER BY id ASC LIMIT ?"
       return try queryItems(sql: sql, values: values)
     case .selection:
@@ -944,6 +953,45 @@ public actor ScanStore {
     }
   }
 
+  /// Applies the scanner's single-pass bottom-up aggregation. The previous SQL
+  /// implementation rescanned a multi-million-row table once per path depth;
+  /// deeply nested dependency trees made that final phase longer than the disk
+  /// traversal itself. Full scans now compute the same rollups while metadata is
+  /// already hot and update each directory exactly once.
+  private func applyDirectoryRollups(scanID: Int64, rollups: [DirectoryRollup]) throws {
+    guard !rollups.isEmpty else { return }
+    let sql = """
+      UPDATE items SET
+        logical_bytes=?, allocated_bytes=?, safety_status=?, rule_id=?, reason=?, confidence=?,
+        source_application=?, is_protected_rule=?
+      WHERE scan_id=? AND id=?
+      """
+    let statement = try database.prepare(sql)
+    defer { sqlite3_finalize(statement) }
+    let ownsTransaction = activeStreamingScanID == nil
+    if ownsTransaction { try database.execute("BEGIN IMMEDIATE") }
+    do {
+      for rollup in rollups {
+        let classification = rollup.classification
+        try database.bind(
+          [
+            .unsigned(rollup.logicalBytes), .unsigned(rollup.allocatedBytes),
+            .text(classification.status.rawValue),
+            classification.ruleID.map(SQLValue.text) ?? .null,
+            .text(classification.reason), .text(classification.confidence.rawValue),
+            classification.sourceApplication.map(SQLValue.text) ?? .null,
+            .integer(classification.isProtectedRule ? 1 : 0),
+            .integer(scanID), .integer(rollup.itemID),
+          ], to: statement, sql: sql)
+        try database.stepDone(statement, sql: sql)
+      }
+      if ownsTransaction { try database.execute("COMMIT") }
+    } catch {
+      if ownsTransaction { try? database.execute("ROLLBACK") }
+      throw error
+    }
+  }
+
   private static func migrate(_ database: SQLiteConnection) throws {
     try database.execute(
       """
@@ -1076,8 +1124,10 @@ public actor ScanStore {
     }
     if version < 3 {
       try? database.execute("ALTER TABLE scans ADD COLUMN scan_mode TEXT NOT NULL DEFAULT 'full'")
-      try? database.execute("ALTER TABLE scans ADD COLUMN reused_item_count INTEGER NOT NULL DEFAULT 0")
-      try? database.execute("ALTER TABLE scans ADD COLUMN journal_complete INTEGER NOT NULL DEFAULT 1")
+      try? database.execute(
+        "ALTER TABLE scans ADD COLUMN reused_item_count INTEGER NOT NULL DEFAULT 0")
+      try? database.execute(
+        "ALTER TABLE scans ADD COLUMN journal_complete INTEGER NOT NULL DEFAULT 1")
       try database.execute("PRAGMA user_version=3")
     }
   }
@@ -1194,7 +1244,9 @@ public actor ScanStore {
     defer { sqlite3_finalize(statement) }
     try database.bind(values, to: statement, sql: sql)
     guard sqlite3_step(statement) == SQLITE_ROW else {
-      return ReuseStats(itemCount: 0, fileCount: 0, directoryCount: 0, logicalBytes: 0, allocatedBytes: 0, maximumDepth: 0)
+      return ReuseStats(
+        itemCount: 0, fileCount: 0, directoryCount: 0, logicalBytes: 0, allocatedBytes: 0,
+        maximumDepth: 0)
     }
     return ReuseStats(
       itemCount: sqlite3_column_int64(statement, 0),

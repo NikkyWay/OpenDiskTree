@@ -178,17 +178,49 @@ ODTDirectoryListing odt_read_directory(const char *path) {
             off_t logical_size = 0;
             off_t allocated_size = 0;
 
-            if (odt_read_field(&field, record_end, &returned, sizeof(returned)) != 0 ||
+            if (odt_read_field(&field, record_end, &returned, sizeof(returned)) != 0) {
+                bulk_failed = 1;
+                break;
+            }
+
+            // FSOPT_PACK_INVAL_ATTRS omits attributes that are not valid for a
+            // particular entry. The returned bitmap is therefore the schema of
+            // this record, not merely diagnostic information. Treating requested
+            // attributes as unconditionally present shifts every following field
+            // and used to send the complete directory through readdir/fstatat.
+            if ((returned.commonattr & ATTR_CMN_ERROR) != 0 &&
                 odt_read_field(&field, record_end, &entry_error, sizeof(entry_error)) != 0) {
                 bulk_failed = 1;
                 break;
             }
-            name_field = field;
-            if (odt_read_field(&field, record_end, &name_reference, sizeof(name_reference)) != 0 ||
-                odt_read_field(&field, record_end, &device_id, sizeof(device_id)) != 0 ||
-                odt_read_field(&field, record_end, &object_type, sizeof(object_type)) != 0 ||
-                odt_read_field(&field, record_end, &created, sizeof(created)) != 0 ||
-                odt_read_field(&field, record_end, &modified, sizeof(modified)) != 0 ||
+            if ((returned.commonattr & ATTR_CMN_NAME) != 0) {
+                name_field = field;
+                if (odt_read_field(&field, record_end, &name_reference, sizeof(name_reference)) != 0) {
+                    bulk_failed = 1;
+                    break;
+                }
+            }
+            if ((returned.commonattr & ATTR_CMN_DEVID) != 0 &&
+                odt_read_field(&field, record_end, &device_id, sizeof(device_id)) != 0) {
+                bulk_failed = 1;
+                break;
+            }
+            if ((returned.commonattr & ATTR_CMN_OBJTYPE) != 0 &&
+                odt_read_field(&field, record_end, &object_type, sizeof(object_type)) != 0) {
+                bulk_failed = 1;
+                break;
+            }
+            if ((returned.commonattr & ATTR_CMN_CRTIME) != 0 &&
+                odt_read_field(&field, record_end, &created, sizeof(created)) != 0) {
+                bulk_failed = 1;
+                break;
+            }
+            if ((returned.commonattr & ATTR_CMN_MODTIME) != 0 &&
+                odt_read_field(&field, record_end, &modified, sizeof(modified)) != 0) {
+                bulk_failed = 1;
+                break;
+            }
+            if ((returned.commonattr & ATTR_CMN_FILEID) != 0 &&
                 odt_read_field(&field, record_end, &file_id, sizeof(file_id)) != 0) {
                 bulk_failed = 1;
                 break;
@@ -214,6 +246,10 @@ ODTDirectoryListing odt_read_directory(const char *path) {
                 break;
             }
 
+            if (entry_error != 0 || name_field == NULL) {
+                cursor = record_end;
+                continue;
+            }
             const char *name = name_field + name_reference.attr_dataoffset;
             if (name_reference.attr_length == 0 || name < record_start || name >= record_end ||
                 name_reference.attr_length > (uint32_t)(record_end - name) ||
@@ -230,7 +266,7 @@ ODTDirectoryListing odt_read_directory(const char *path) {
                 ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
             const attrgroup_t required_file =
                 ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE;
-            int needs_stat = entry_error != 0 ||
+            int needs_stat =
                 (returned.commonattr & required_common) != required_common ||
                 ((object_type == VREG || object_type == VLNK) &&
                  (returned.fileattr & required_file) != required_file);

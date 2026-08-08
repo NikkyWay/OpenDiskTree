@@ -44,8 +44,7 @@ public struct ScanOptions: Sendable {
     crossSelectedVolume: Bool = false,
     mode: ScanMode = .full,
     startingItemID: Int64 = 2
-  )
-  {
+  ) {
     self.rootURL = rootURL.standardizedFileURL
     self.intensity = intensity
     self.crossSelectedVolume = crossSelectedVolume
@@ -62,6 +61,7 @@ public struct ReusedSubtree: Sendable, Equatable {
   public let logicalBytes: UInt64
   public let allocatedBytes: UInt64
   public let maximumDepth: Int
+  public let classification: Classification
 
   public init(
     itemID: Int64,
@@ -70,7 +70,8 @@ public struct ReusedSubtree: Sendable, Equatable {
     directoryCount: Int64,
     logicalBytes: UInt64,
     allocatedBytes: UInt64,
-    maximumDepth: Int
+    maximumDepth: Int,
+    classification: Classification
   ) {
     self.itemID = itemID
     self.itemCount = itemCount
@@ -79,6 +80,7 @@ public struct ReusedSubtree: Sendable, Equatable {
     self.logicalBytes = logicalBytes
     self.allocatedBytes = allocatedBytes
     self.maximumDepth = maximumDepth
+    self.classification = classification
   }
 }
 
@@ -98,6 +100,78 @@ private struct ReadOutcome: Sendable {
 private struct FileIdentity: Hashable, Sendable {
   let device: UInt64
   let file: UInt64
+}
+
+private struct WorkingDirectoryRollup: Sendable {
+  let itemID: Int64
+  let parentID: Int64?
+  let ownClassification: Classification
+  var logicalBytes: UInt64 = 0
+  var allocatedBytes: UInt64 = 0
+  var maximumChildRisk = 0
+  var nonReviewChildren = 0
+  var childCount = 0
+  var containsProtectedRule = false
+  var precomputedClassification: Classification?
+
+  mutating func absorb(
+    logicalBytes: UInt64,
+    allocatedBytes: UInt64,
+    classification: Classification
+  ) {
+    self.logicalBytes &+= logicalBytes
+    self.allocatedBytes &+= allocatedBytes
+    maximumChildRisk = max(maximumChildRisk, classification.status.riskRank)
+    if classification.status != .review { nonReviewChildren += 1 }
+    childCount += 1
+    containsProtectedRule = containsProtectedRule || classification.isProtectedRule
+  }
+
+  mutating func useReusedSubtree(_ subtree: ReusedSubtree) {
+    logicalBytes = subtree.logicalBytes
+    allocatedBytes = subtree.allocatedBytes
+    precomputedClassification = subtree.classification
+  }
+
+  func finalizedClassification() -> Classification {
+    if let precomputedClassification { return precomputedClassification }
+    if ownClassification.isProtectedRule,
+      ownClassification.status == .doNotTouch || ownClassification.status == .deleteViaSourceApp
+    {
+      return ownClassification
+    }
+
+    let status: SafetyStatus
+    let reason: String
+    switch maximumChildRisk {
+    case 5...:
+      status = .doNotTouch
+      reason = "This folder contains protected data and must not be removed directly."
+    case 4:
+      status = .deleteViaSourceApp
+      reason =
+        "This folder contains application-managed data. Use the source application for cleanup."
+    case 0:
+      status = .safeToDelete
+      reason = "All scanned contents matched safe cleanup rules."
+    case 1:
+      status = .recreatedAutomatically
+      reason = "All scanned contents are disposable or can be rebuilt automatically."
+    case 2 where nonReviewChildren == 0:
+      status = .review
+      reason = "No trusted cleanup rule matched this folder or its contents."
+    default:
+      status = .mixed
+      reason = "This folder contains mixed safety statuses. Inspect its contents before cleanup."
+    }
+    return Classification(
+      status: status,
+      ruleID: "aggregate.folder",
+      reason: reason,
+      confidence: .high,
+      isProtectedRule: ownClassification.isProtectedRule || containsProtectedRule
+    )
+  }
 }
 
 public final class DiskScanner: Sendable {
@@ -136,6 +210,17 @@ public final class DiskScanner: Sendable {
     var fallbackCount = 0
     var maximumDepth = 0
     var reusedItemCount: Int64 = 0
+    let collectDirectoryRollups = true
+    var directoryOrder: [Int64] = [rootItemID]
+    var workingDirectories: [Int64: WorkingDirectoryRollup] = [:]
+    if collectDirectoryRollups {
+      workingDirectories.reserveCapacity(400_000)
+      workingDirectories[rootItemID] = WorkingDirectoryRollup(
+        itemID: rootItemID,
+        parentID: nil,
+        ownClassification: ruleEngine.classify(path: rootPath, kind: .directory)
+      )
+    }
     // Larger transactions avoid SQLite fsync/prepare overhead on metadata-heavy scans.
     // The live refresh gate in AppModel keeps the first useful rows responsive.
     let batchLimit = options.intensity == .turbo ? 32_768 : 16_384
@@ -146,39 +231,35 @@ public final class DiskScanner: Sendable {
     let minimumFlushCount = options.intensity == .turbo ? 8_192 : 4_096
     let flushInterval: TimeInterval = 0.75
 
-    while cursor < queue.count {
-      guard await control.checkpoint(), !Task.isCancelled else { break }
-      let end = min(queue.count, cursor + options.intensity.parallelism)
-      let slice = Array(queue[cursor..<end])
-      cursor = end
+    try await withThrowingTaskGroup(of: ReadOutcome.self) { group in
+      let parallelism = options.intensity.parallelism
+      var activeReaders = 0
+      var errors: [ScanErrorRecord] = []
 
-      let outcomes = await withTaskGroup(of: ReadOutcome.self, returning: [ReadOutcome].self) {
-        group in
-        for directory in slice {
-          group.addTask {
-            do {
-              return ReadOutcome(
-                directory: directory, listing: try FastDirectoryReader.read(path: directory.path),
-                error: nil)
-            } catch let error as DirectoryReadError {
-              return ReadOutcome(directory: directory, listing: nil, error: error)
-            } catch {
-              return ReadOutcome(
-                directory: directory,
-                listing: nil,
-                error: .posix(path: directory.path, code: EIO, message: error.localizedDescription)
-              )
-            }
-          }
-        }
-        var collected: [ReadOutcome] = []
-        for await outcome in group { collected.append(outcome) }
-        return collected
+      while activeReaders < parallelism && cursor < queue.count {
+        let directory = queue[cursor]
+        cursor += 1
+        activeReaders += 1
+        group.addTask { Self.readDirectory(directory) }
       }
 
-      var errors: [ScanErrorRecord] = []
-      for outcome in outcomes {
-        guard await control.checkpoint() else { break }
+      while activeReaders > 0 {
+        guard await control.checkpoint(), !Task.isCancelled else {
+          group.cancelAll()
+          break
+        }
+        guard let outcome = try await group.next() else { break }
+        activeReaders -= 1
+
+        // Keep readers busy with already discovered work before processing a
+        // potentially very wide directory on the coordinator task.
+        while activeReaders < parallelism && cursor < queue.count {
+          let directory = queue[cursor]
+          cursor += 1
+          activeReaders += 1
+          group.addTask { Self.readDirectory(directory) }
+        }
+
         progress.currentPath = outcome.directory.path
         if let error = outcome.error {
           progress.inaccessible += 1
@@ -189,147 +270,203 @@ public final class DiskScanner: Sendable {
               code: error.code,
               message: error.message
             ))
-          continue
-        }
-        guard let listing = outcome.listing else { continue }
-        if listing.usedBulkAPI { bulkCount += 1 } else { fallbackCount += 1 }
+        } else if let listing = outcome.listing {
+          if listing.usedBulkAPI { bulkCount += 1 } else { fallbackCount += 1 }
 
-        var entriesSinceCheckpoint = 0
-        for entry in listing.entries {
-          // Checking an actor for every directory entry is disproportionately
-          // expensive on metadata-heavy trees. Task cancellation remains cheap
-          // per item; pause/cancel actor state is sampled often enough to stay
-          // responsive without turning the hot path into millions of awaits.
-          guard !Task.isCancelled else { break }
-          entriesSinceCheckpoint += 1
-          if entriesSinceCheckpoint >= 256 {
-            entriesSinceCheckpoint = 0
-            guard await control.checkpoint() else { break }
-          }
-          let path =
-            outcome.directory.path == "/"
-            ? "/\(entry.name)" : "\(outcome.directory.path)/\(entry.name)"
-          if Self.shouldSkip(path: path, rootPath: rootPath) { continue }
+          var entriesSinceCheckpoint = 0
+          for entry in listing.entries {
+            // Checking an actor for every directory entry is disproportionately
+            // expensive on metadata-heavy trees. Task cancellation remains cheap
+            // per item; pause/cancel actor state is sampled often enough to stay
+            // responsive without turning the hot path into millions of awaits.
+            guard !Task.isCancelled else { break }
+            entriesSinceCheckpoint += 1
+            if entriesSinceCheckpoint >= 256 {
+              entriesSinceCheckpoint = 0
+              guard await control.checkpoint() else { break }
+            }
+            let path =
+              outcome.directory.path == "/"
+              ? "/\(entry.name)" : "\(outcome.directory.path)/\(entry.name)"
+            if Self.shouldSkip(path: path, rootPath: rootPath) { continue }
 
-          let depth = outcome.directory.depth + 1
-          maximumDepth = max(maximumDepth, depth)
-          let isContainer = entry.kind.canHaveChildren
-          let ownLogical = isContainer ? 0 : entry.logicalBytes
-          let ownAllocated = isContainer ? 0 : entry.allocatedBytes
-          var accountedAllocated = ownAllocated
-          if entry.kind == .file && entry.linkCount > 1 {
-            let identity = FileIdentity(device: entry.deviceID, file: entry.fileID)
-            if !linkedStorage.insert(identity).inserted { accountedAllocated = 0 }
-          }
-          let classification = ruleEngine.classify(path: path, kind: entry.kind)
-          let provisionalID = nextID
-          nextID += 1
-          let provisionalItem = ScannedItem(
-            id: provisionalID,
-            scanID: scanID,
-            parentID: outcome.directory.id,
-            path: path,
-            name: entry.name,
-            depth: depth,
-            kind: entry.kind,
-            fileExtension: entry.fileExtension,
-            ownLogicalBytes: ownLogical,
-            ownAllocatedBytes: ownAllocated,
-            accountedAllocatedBytes: accountedAllocated,
-            logicalBytes: ownLogical,
-            allocatedBytes: accountedAllocated,
-            createdAt: entry.createdAt,
-            modifiedAt: entry.modifiedAt,
-            deviceID: entry.deviceID,
-            fileID: entry.fileID,
-            linkCount: entry.linkCount,
-            isHidden: entry.isHidden,
-            isPackage: entry.isPackage,
-            classification: classification
-          )
-          let reuse = isContainer ? try await onReuseCandidate(provisionalItem) : nil
-          let id: Int64
-          let item: ScannedItem
-          if let reuse {
-            // Reused IDs keep parent references stable across snapshots. The store
-            // copies descendants only after this parent row has been committed.
-            id = reuse.itemID
-            item = ScannedItem(
-              id: id, scanID: provisionalItem.scanID, parentID: provisionalItem.parentID,
-              path: provisionalItem.path, name: provisionalItem.name, depth: provisionalItem.depth,
-              kind: provisionalItem.kind, fileExtension: provisionalItem.fileExtension,
-              ownLogicalBytes: provisionalItem.ownLogicalBytes,
-              ownAllocatedBytes: provisionalItem.ownAllocatedBytes,
-              accountedAllocatedBytes: provisionalItem.accountedAllocatedBytes,
-              logicalBytes: provisionalItem.logicalBytes, allocatedBytes: provisionalItem.allocatedBytes,
-              createdAt: provisionalItem.createdAt, modifiedAt: provisionalItem.modifiedAt,
-              deviceID: provisionalItem.deviceID, fileID: provisionalItem.fileID,
-              linkCount: provisionalItem.linkCount, isHidden: provisionalItem.isHidden,
-              isPackage: provisionalItem.isPackage, classification: provisionalItem.classification
+            let depth = outcome.directory.depth + 1
+            maximumDepth = max(maximumDepth, depth)
+            let isContainer = entry.kind.canHaveChildren
+            let ownLogical = isContainer ? 0 : entry.logicalBytes
+            let ownAllocated = isContainer ? 0 : entry.allocatedBytes
+            var accountedAllocated = ownAllocated
+            if entry.kind == .file && entry.linkCount > 1 {
+              let identity = FileIdentity(device: entry.deviceID, file: entry.fileID)
+              if !linkedStorage.insert(identity).inserted { accountedAllocated = 0 }
+            }
+            let classification = ruleEngine.classify(
+              path: path,
+              kind: entry.kind,
+              fileExtension: entry.fileExtension
             )
-          } else {
-            id = provisionalID
-            item = provisionalItem
-          }
-          bufferedItems.append(item)
-          if isContainer {
-            progress.directories += 1
+            let provisionalID = nextID
+            nextID += 1
+            let provisionalItem = ScannedItem(
+              id: provisionalID,
+              scanID: scanID,
+              parentID: outcome.directory.id,
+              path: path,
+              name: entry.name,
+              depth: depth,
+              kind: entry.kind,
+              fileExtension: entry.fileExtension,
+              ownLogicalBytes: ownLogical,
+              ownAllocatedBytes: ownAllocated,
+              accountedAllocatedBytes: accountedAllocated,
+              logicalBytes: ownLogical,
+              allocatedBytes: accountedAllocated,
+              createdAt: entry.createdAt,
+              modifiedAt: entry.modifiedAt,
+              deviceID: entry.deviceID,
+              fileID: entry.fileID,
+              linkCount: entry.linkCount,
+              isHidden: entry.isHidden,
+              isPackage: entry.isPackage,
+              classification: classification
+            )
+            let reuse = isContainer ? try await onReuseCandidate(provisionalItem) : nil
+            let id: Int64
+            let item: ScannedItem
             if let reuse {
-              // Flush the parent first: the SQL clone uses its stable ID as the
-              // parent reference for every copied descendant.
+              // Reused IDs keep parent references stable across snapshots. The store
+              // copies descendants only after this parent row has been committed.
+              id = reuse.itemID
+              item = ScannedItem(
+                id: id, scanID: provisionalItem.scanID, parentID: provisionalItem.parentID,
+                path: provisionalItem.path, name: provisionalItem.name,
+                depth: provisionalItem.depth,
+                kind: provisionalItem.kind, fileExtension: provisionalItem.fileExtension,
+                ownLogicalBytes: provisionalItem.ownLogicalBytes,
+                ownAllocatedBytes: provisionalItem.ownAllocatedBytes,
+                accountedAllocatedBytes: provisionalItem.accountedAllocatedBytes,
+                logicalBytes: provisionalItem.logicalBytes,
+                allocatedBytes: provisionalItem.allocatedBytes,
+                createdAt: provisionalItem.createdAt, modifiedAt: provisionalItem.modifiedAt,
+                deviceID: provisionalItem.deviceID, fileID: provisionalItem.fileID,
+                linkCount: provisionalItem.linkCount, isHidden: provisionalItem.isHidden,
+                isPackage: provisionalItem.isPackage, classification: provisionalItem.classification
+              )
+            } else {
+              id = provisionalID
+              item = provisionalItem
+            }
+            bufferedItems.append(item)
+            if isContainer {
+              if collectDirectoryRollups {
+                directoryOrder.append(id)
+                workingDirectories[id] = WorkingDirectoryRollup(
+                  itemID: id,
+                  parentID: outcome.directory.id,
+                  ownClassification: classification
+                )
+              }
+              progress.directories += 1
+              if let reuse {
+                workingDirectories[id]?.useReusedSubtree(reuse)
+                // Flush the parent first: the SQL clone uses its stable ID as the
+                // parent reference for every copied descendant.
+                try await onBatch(bufferedItems, progress)
+                bufferedItems.removeAll(keepingCapacity: true)
+                try await onReuseSubtree(reuse, item)
+                reusedItemCount += reuse.itemCount
+                progress.files += reuse.fileCount
+                progress.directories += reuse.directoryCount
+                progress.logicalBytes &+= reuse.logicalBytes
+                progress.allocatedBytes &+= reuse.allocatedBytes
+                maximumDepth = max(maximumDepth, reuse.maximumDepth)
+                continue
+              }
+              if Self.shouldTraverseDirectory(
+                rootDeviceID: rootStat.deviceID,
+                entryDeviceID: entry.deviceID,
+                isMountPoint: entry.isMountPoint,
+                crossSelectedVolume: options.crossSelectedVolume)
+              {
+                queue.append(
+                  PendingDirectory(id: id, path: path, depth: depth, deviceID: entry.deviceID))
+              }
+            } else {
+              if collectDirectoryRollups {
+                workingDirectories[outcome.directory.id]?.absorb(
+                  logicalBytes: ownLogical,
+                  allocatedBytes: accountedAllocated,
+                  classification: classification
+                )
+              }
+              progress.files += 1
+              progress.logicalBytes &+= ownLogical
+              progress.allocatedBytes &+= accountedAllocated
+            }
+
+            if bufferedItems.count >= batchLimit {
+              await onProgress(progress)
               try await onBatch(bufferedItems, progress)
               bufferedItems.removeAll(keepingCapacity: true)
-              try await onReuseSubtree(reuse, item)
-              reusedItemCount += reuse.itemCount
-              progress.files += reuse.fileCount
-              progress.directories += reuse.directoryCount
-              progress.logicalBytes &+= reuse.logicalBytes
-              progress.allocatedBytes &+= reuse.allocatedBytes
-              maximumDepth = max(maximumDepth, reuse.maximumDepth)
-              continue
+              lastFlush = Date()
             }
-            if Self.shouldTraverseDirectory(
-              rootDeviceID: rootStat.deviceID,
-              entryDeviceID: entry.deviceID,
-              isMountPoint: entry.isMountPoint,
-              crossSelectedVolume: options.crossSelectedVolume)
-            {
-              queue.append(
-                PendingDirectory(id: id, path: path, depth: depth, deviceID: entry.deviceID))
-            }
-          } else {
-            progress.files += 1
-            progress.logicalBytes &+= ownLogical
-            progress.allocatedBytes &+= accountedAllocated
           }
+        }
 
-          if bufferedItems.count >= batchLimit {
-            await onProgress(progress)
-            try await onBatch(bufferedItems, progress)
-            bufferedItems.removeAll(keepingCapacity: true)
-            lastFlush = Date()
-          }
+        while activeReaders < parallelism && cursor < queue.count {
+          let directory = queue[cursor]
+          cursor += 1
+          activeReaders += 1
+          group.addTask { Self.readDirectory(directory) }
+        }
+        if errors.count >= 128 {
+          try await onErrors(errors)
+          errors.removeAll(keepingCapacity: true)
+        }
+        if Date().timeIntervalSince(lastProgressUpdate) >= 0.5 {
+          await onProgress(progress)
+          lastProgressUpdate = Date()
+        }
+        if bufferedItems.count >= minimumFlushCount
+          && Date().timeIntervalSince(lastFlush) >= flushInterval
+        {
+          try await onBatch(bufferedItems, progress)
+          bufferedItems.removeAll(keepingCapacity: true)
+          lastFlush = Date()
+        }
+        if cursor > 10_000 && cursor > queue.count / 2 {
+          queue.removeFirst(cursor)
+          cursor = 0
         }
       }
       if !errors.isEmpty { try await onErrors(errors) }
-      if Date().timeIntervalSince(lastProgressUpdate) >= 0.5 {
-        await onProgress(progress)
-        lastProgressUpdate = Date()
-      }
-      if bufferedItems.count >= minimumFlushCount
-        && Date().timeIntervalSince(lastFlush) >= flushInterval
-      {
-        try await onBatch(bufferedItems, progress)
-        bufferedItems.removeAll(keepingCapacity: true)
-        lastFlush = Date()
-      }
-      if cursor > 10_000 && cursor > queue.count / 2 {
-        queue.removeFirst(cursor)
-        cursor = 0
-      }
     }
 
     if !bufferedItems.isEmpty { try await onBatch(bufferedItems, progress) }
+
+    var directoryRollups: [DirectoryRollup] = []
+    let controlCancelled = await control.isCancelled()
+    if collectDirectoryRollups && !Task.isCancelled && !controlCancelled {
+      directoryRollups.reserveCapacity(directoryOrder.count)
+      for itemID in directoryOrder.reversed() {
+        guard let working = workingDirectories.removeValue(forKey: itemID) else { continue }
+        let classification = working.finalizedClassification()
+        directoryRollups.append(
+          DirectoryRollup(
+            itemID: working.itemID,
+            logicalBytes: working.logicalBytes,
+            allocatedBytes: working.allocatedBytes,
+            classification: classification
+          ))
+        if let parentID = working.parentID {
+          workingDirectories[parentID]?.absorb(
+            logicalBytes: working.logicalBytes,
+            allocatedBytes: working.allocatedBytes,
+            classification: classification
+          )
+        }
+      }
+    }
 
     return ScannerResult(
       progress: progress,
@@ -338,7 +475,8 @@ public final class DiskScanner: Sendable {
       fallbackDirectoryCount: fallbackCount,
       maximumDepth: maximumDepth,
       reusedItemCount: reusedItemCount,
-      journalComplete: true
+      journalComplete: true,
+      directoryRollups: directoryRollups
     )
   }
 
@@ -375,6 +513,24 @@ public final class DiskScanner: Sendable {
       info.st_mtimespec.tv_sec > 0
         ? Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec)) : nil
     )
+  }
+
+  private static func readDirectory(_ directory: PendingDirectory) -> ReadOutcome {
+    do {
+      return ReadOutcome(
+        directory: directory,
+        listing: try FastDirectoryReader.read(path: directory.path),
+        error: nil
+      )
+    } catch let error as DirectoryReadError {
+      return ReadOutcome(directory: directory, listing: nil, error: error)
+    } catch {
+      return ReadOutcome(
+        directory: directory,
+        listing: nil,
+        error: .posix(path: directory.path, code: EIO, message: error.localizedDescription)
+      )
+    }
   }
 
   static func shouldTraverseDirectory(

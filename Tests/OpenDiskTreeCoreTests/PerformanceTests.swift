@@ -3,6 +3,67 @@ import Testing
 
 @testable import OpenDiskTreeCore
 
+@Test(.timeLimit(.minutes(20)))
+func realFilesystemTraversalBenchmark() async throws {
+  guard let path = ProcessInfo.processInfo.environment["OPENDISKTREE_BENCHMARK_ROOT"],
+    !path.isEmpty
+  else { return }
+
+  let root = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+  let scanner = DiskScanner()
+  let clock = ContinuousClock()
+  let intensity: ScanIntensity =
+    ProcessInfo.processInfo.environment["OPENDISKTREE_BENCHMARK_INTENSITY"] == "balanced"
+    ? .balanced : .turbo
+  if ProcessInfo.processInfo.environment["OPENDISKTREE_BENCHMARK_STORE"] == "1" {
+    let scratch = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "OpenDiskTreeRealBenchmark-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: scratch) }
+    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    let store = try ScanStore(databaseURL: scratch.appendingPathComponent("benchmark.sqlite"))
+    let scan = try await store.beginScan(rootURL: root, intensity: intensity)
+    let rootItem = try DiskScanner.makeRootItem(scanID: scan.id, id: 1, url: root)
+    try await store.insert([rootItem])
+    let batchWriter = ScanBatchWriter(store: store)
+    let totalStarted = clock.now
+    let traversalStarted = clock.now
+    let result = try await scanner.scan(
+      scanID: scan.id, rootItemID: 1,
+      options: ScanOptions(rootURL: root, intensity: intensity),
+      onBatch: { items, _ in try await batchWriter.submit(items) },
+      onErrors: { errors in try await store.insert(errors: errors) }
+    )
+    try await batchWriter.finish()
+    let traversalElapsed = traversalStarted.duration(to: clock.now)
+    let finalizationStarted = clock.now
+    _ = try await store.finishScan(scan.id, result: result)
+    let finalizationElapsed = finalizationStarted.duration(to: clock.now)
+    let totalElapsed = totalStarted.duration(to: clock.now)
+    let itemCount = result.progress.files + result.progress.directories
+    print(
+      "Persisted \(itemCount.formatted()) real metadata rows under \(root.path): "
+        + "traversal+write \(traversalElapsed), finalization \(finalizationElapsed), "
+        + "total \(totalElapsed)"
+    )
+    return
+  }
+
+  let started = clock.now
+  let result = try await scanner.scan(
+    scanID: 0, rootItemID: 1,
+    options: ScanOptions(rootURL: root, intensity: intensity),
+    onBatch: { _, _ in },
+    onErrors: { _ in }
+  )
+  let elapsed = started.duration(to: clock.now)
+  let itemCount = result.progress.files + result.progress.directories
+  print(
+    "Traversed \(itemCount.formatted()) real metadata rows under \(root.path) in \(elapsed) "
+      + "(bulk directories: \(result.bulkDirectoryCount.formatted()), "
+      + "fallback: \(result.fallbackDirectoryCount.formatted()))"
+  )
+}
+
 @Test(.timeLimit(.minutes(1)))
 func scannerMetadataBenchmark() async throws {
   let root = FileManager.default.temporaryDirectory.appendingPathComponent(

@@ -65,24 +65,43 @@ public struct RuleDocument: Codable, Sendable, Equatable {
 }
 
 public struct RuleEngine: Sendable {
+  private struct CompiledRule: Sendable {
+    let rule: CleanupRule
+    let pattern: String
+    let suffixExtension: String?
+  }
+
   public let rules: [CleanupRule]
+  private let compiledRules: [CompiledRule]
   private let homePath: String
 
   public init(
     userRules: [CleanupRule] = [], homePath: String = NSHomeDirectory(),
     allowProtectedOverrides: Bool = false
   ) {
-    self.homePath = homePath
-    self.rules = (userRules + Self.builtInRules).sorted {
+    let sortedRules = (userRules + Self.builtInRules).sorted {
       if !allowProtectedOverrides && $0.isProtected != $1.isProtected { return $0.isProtected }
       if $0.isUserRule != $1.isUserRule { return $0.isUserRule }
       return $0.priority > $1.priority
     }
+    self.homePath = homePath
+    self.rules = sortedRules
+    self.compiledRules = sortedRules.map {
+      let pattern = Self.expandHome(in: $0.pattern, homePath: homePath)
+      let suffixExtension =
+        $0.matchKind == .suffix && pattern.hasPrefix(".") && !pattern.dropFirst().contains("/")
+        ? String(pattern.dropFirst()).lowercased() : nil
+      return CompiledRule(rule: $0, pattern: pattern, suffixExtension: suffixExtension)
+    }
   }
 
-  public func classify(path: String, kind: ItemKind) -> Classification {
-    let normalized = normalize(path)
-    guard let rule = rules.first(where: { matches($0, path: normalized, kind: kind) }) else {
+  public func classify(path: String, kind: ItemKind, fileExtension: String? = nil) -> Classification
+  {
+    guard
+      let rule = compiledRules.first(where: {
+        matches($0, path: path, kind: kind, fileExtension: fileExtension)
+      })?.rule
+    else {
       return .review
     }
     return Classification(
@@ -96,7 +115,16 @@ public struct RuleEngine: Sendable {
   }
 
   public func matchingItems(for rule: CleanupRule, in items: [ScannedItem]) -> [ScannedItem] {
-    items.filter { matches(rule, path: normalize($0.path), kind: $0.kind) }
+    let compiled = CompiledRule(
+      rule: rule,
+      pattern: Self.expandHome(in: rule.pattern, homePath: homePath),
+      suffixExtension: rule.matchKind == .suffix && rule.pattern.hasPrefix(".")
+        && !rule.pattern.dropFirst().contains("/")
+        ? String(rule.pattern.dropFirst()).lowercased() : nil
+    )
+    return items.filter {
+      matches(compiled, path: $0.path, kind: $0.kind, fileExtension: $0.fileExtension)
+    }
   }
 
   public static func aggregate(_ classifications: [Classification]) -> Classification {
@@ -123,19 +151,36 @@ public struct RuleEngine: Sendable {
     )
   }
 
-  private func normalize(_ path: String) -> String {
-    guard path == homePath || path.hasPrefix(homePath + "/") else { return path }
-    return "~" + path.dropFirst(homePath.count)
+  private static func expandHome(in pattern: String, homePath: String) -> String {
+    if pattern == "~" { return homePath }
+    if pattern.hasPrefix("~/") { return homePath + pattern.dropFirst() }
+    return pattern
   }
 
-  private func matches(_ rule: CleanupRule, path: String, kind: ItemKind) -> Bool {
+  private func matches(
+    _ compiled: CompiledRule,
+    path: String,
+    kind: ItemKind,
+    fileExtension: String?
+  ) -> Bool {
+    let rule = compiled.rule
     guard rule.isEnabled, rule.kinds.isEmpty || rule.kinds.contains(kind) else { return false }
     return switch rule.matchKind {
-    case .prefix: path == rule.pattern || path.hasPrefix(rule.pattern + "/")
-    case .contains: path.localizedCaseInsensitiveContains(rule.pattern)
-    case .suffix: path.lowercased().hasSuffix(rule.pattern.lowercased())
+    case .prefix: path == compiled.pattern || path.hasPrefix(compiled.pattern + "/")
+    case .contains:
+      path.range(of: compiled.pattern, options: [.caseInsensitive]) != nil
+    case .suffix:
+      if let suffixExtension = compiled.suffixExtension, let fileExtension {
+        fileExtension == suffixExtension
+      } else {
+        path.hasSuffix(compiled.pattern)
+          || path.range(
+            of: compiled.pattern,
+            options: [.caseInsensitive, .anchored, .backwards]
+          ) != nil
+      }
     case .glob:
-      rule.pattern.withCString { pattern in path.withCString { fnmatch(pattern, $0, 0) == 0 } }
+      compiled.pattern.withCString { pattern in path.withCString { fnmatch(pattern, $0, 0) == 0 } }
     }
   }
 

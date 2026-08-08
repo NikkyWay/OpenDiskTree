@@ -6,8 +6,8 @@ public enum ScanIntensity: String, Codable, CaseIterable, Sendable {
 
   public var parallelism: Int {
     switch self {
-    case .balanced: max(2, min(6, ProcessInfo.processInfo.activeProcessorCount / 2))
-    case .turbo: max(4, min(16, ProcessInfo.processInfo.activeProcessorCount))
+    case .balanced: max(8, min(16, ProcessInfo.processInfo.activeProcessorCount * 2))
+    case .turbo: 64
     }
   }
 }
@@ -295,6 +295,7 @@ public struct ScannerResult: Sendable, Equatable {
   public let maximumDepth: Int
   public let reusedItemCount: Int64
   public let journalComplete: Bool
+  public let directoryRollups: [DirectoryRollup]
 
   public init(
     progress: ScanProgress,
@@ -303,7 +304,8 @@ public struct ScannerResult: Sendable, Equatable {
     fallbackDirectoryCount: Int,
     maximumDepth: Int,
     reusedItemCount: Int64 = 0,
-    journalComplete: Bool = true
+    journalComplete: Bool = true,
+    directoryRollups: [DirectoryRollup] = []
   ) {
     self.progress = progress
     self.cancelled = cancelled
@@ -312,6 +314,26 @@ public struct ScannerResult: Sendable, Equatable {
     self.maximumDepth = maximumDepth
     self.reusedItemCount = reusedItemCount
     self.journalComplete = journalComplete
+    self.directoryRollups = directoryRollups
+  }
+}
+
+public struct DirectoryRollup: Sendable, Equatable {
+  public let itemID: Int64
+  public let logicalBytes: UInt64
+  public let allocatedBytes: UInt64
+  public let classification: Classification
+
+  public init(
+    itemID: Int64,
+    logicalBytes: UInt64,
+    allocatedBytes: UInt64,
+    classification: Classification
+  ) {
+    self.itemID = itemID
+    self.logicalBytes = logicalBytes
+    self.allocatedBytes = allocatedBytes
+    self.classification = classification
   }
 }
 
