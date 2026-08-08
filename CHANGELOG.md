@@ -2,6 +2,10 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.2.1 — 2026-08-09
+
+- Batch JSON page writes into a single buffered filesystem write and reuse one RFC 3339 formatter during export.
+
 ## 1.2.0 — 2026-08-09
 
 - Sample scanner pause/cancel state every 256 entries instead of paying an actor hop for every metadata row.

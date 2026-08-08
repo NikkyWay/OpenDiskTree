@@ -149,6 +149,11 @@ private struct AIReport: Encodable {
 }
 
 public actor ScanExporter {
+  private final class ISO8601FormatterBox: @unchecked Sendable {
+    let value = ISO8601DateFormatter()
+  }
+
+  private static let iso8601Formatter = ISO8601FormatterBox()
   private let store: ScanStore
 
   public init(store: ScanStore) { self.store = store }
@@ -246,13 +251,16 @@ public actor ScanExporter {
         : try await store.fetchItemsPage(
           scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
       if page.isEmpty { break }
+      var pageData = Data()
+      pageData.reserveCapacity(page.count * 320)
       for item in page {
-        if !first { try write(Data(",".utf8)) }
+        if !first { pageData.append(contentsOf: Data(",".utf8)) }
         first = false
         let exported = ExportItem(
           item, path: redactor.redact(item.path), includeHashDetails: options.privacy != .strict)
-        try write(encoder.encode(exported))
+        try pageData.append(encoder.encode(exported))
       }
+      try write(pageData)
       offset += page.count
       if useKeyset { lastID = page.last?.id ?? lastID }
       await onProgress(ExportProgress(exportedItems: offset, bytesWritten: written))
@@ -583,7 +591,7 @@ public actor ScanExporter {
   }
 
   private static func dateString(_ date: Date) -> String {
-    ISO8601DateFormatter().string(from: date)
+    iso8601Formatter.value.string(from: date)
   }
 
   private static func scopeName(_ scope: ExportScope) -> String {
