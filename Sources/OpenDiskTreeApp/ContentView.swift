@@ -180,6 +180,16 @@ struct ContentView: View {
             Label(String(localized: "scan.cancel"), systemImage: "stop.fill")
           }
         } else {
+          if model.isExporting {
+            ProgressView().controlSize(.small)
+            if let progress = model.exportProgress {
+              Text("\(String(localized: "export.progress")) \(progress.exportedItems.formatted())")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Button(String(localized: "export.cancel"), action: model.cancelExport)
+              .buttonStyle(.bordered)
+          }
           Menu {
             Button("Scan Folder", action: model.chooseFolder)
             Button("Scan Full Disk", action: model.scanFullDisk)
@@ -274,7 +284,7 @@ struct ContentView: View {
     } label: {
       Label("Export", systemImage: "square.and.arrow.up")
     }
-    .disabled(model.currentScan == nil || model.isScanning)
+    .disabled(model.currentScan == nil || model.isScanning || model.isExporting)
   }
 
   @ViewBuilder

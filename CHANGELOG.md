@@ -2,6 +2,10 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.2.2 — 2026-08-09
+
+- Show export progress in the toolbar and allow cancelling a large export without leaving a partial destination file.
+
 ## 1.2.1 — 2026-08-09
 
 - Batch JSON page writes into a single buffered filesystem write and reuse one RFC 3339 formatter during export.

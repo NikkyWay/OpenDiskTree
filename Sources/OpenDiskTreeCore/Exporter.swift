@@ -29,6 +29,11 @@ public struct ExportOptions: Sendable {
 public struct ExportProgress: Sendable, Equatable {
   public let exportedItems: Int
   public let bytesWritten: UInt64
+
+  public init(exportedItems: Int, bytesWritten: UInt64) {
+    self.exportedItems = exportedItems
+    self.bytesWritten = bytesWritten
+  }
 }
 
 private struct ExportManifest: Encodable {
@@ -245,6 +250,7 @@ public actor ScanExporter {
     let useKeyset = !isSelectionScope(options.scope)
     var first = true
     while true {
+      try Task.checkCancellation()
       let page = useKeyset
         ? try await store.fetchItemsPageAfterID(
           scanID: scanID, scope: options.scope, afterID: lastID, limit: 5_000)
@@ -286,6 +292,7 @@ public actor ScanExporter {
     let useKeyset = !isSelectionScope(options.scope)
     var redactor = PathRedactor(mode: options.privacy)
     while true {
+      try Task.checkCancellation()
       let page = useKeyset
         ? try await store.fetchItemsPageAfterID(
           scanID: scanID, scope: options.scope, afterID: lastID, limit: 5_000)
@@ -402,6 +409,7 @@ public actor ScanExporter {
     var lastID: Int64 = 0
     let useKeyset = !isSelectionScope(options.scope)
     while true {
+      try Task.checkCancellation()
       let page = useKeyset
         ? try await store.fetchItemsPageAfterID(
           scanID: scanID, scope: options.scope, afterID: lastID, limit: 5_000)
@@ -493,6 +501,7 @@ public actor ScanExporter {
     } else {
       var offset = 0
       while true {
+        try Task.checkCancellation()
         let page = try await store.fetchItemsPage(
           scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
         if page.isEmpty { break }
@@ -608,6 +617,7 @@ public actor ScanExporter {
     var memberSizes: [Int64: UInt64] = [:]
     var offset = 0
     while true {
+      try Task.checkCancellation()
       let page = try await store.fetchItemsPage(
         scanID: scanID, scope: scope, limit: 5_000, offset: offset)
       if page.isEmpty { break }

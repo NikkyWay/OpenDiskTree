@@ -24,6 +24,8 @@
 "Logical" = "Logical";
 "Duplicates" = "Duplicates";
 "Export" = "Export";
+"export.progress" = "Exporting";
+"export.cancel" = "Cancel export";
 "Privacy" = "Privacy";
 "Full paths" = "Full paths";
 "Hide home and volume" = "Hide home and volume";

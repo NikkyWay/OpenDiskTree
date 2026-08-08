@@ -32,6 +32,8 @@ final class AppModel: ObservableObject {
   @Published var isPreliminary = false
   @Published var isPaused = false
   @Published var isFindingDuplicates = false
+  @Published var isExporting = false
+  @Published var exportProgress: ExportProgress?
   @Published var duplicateProgress: DuplicateProgress?
   @Published var statusMessage = "Choose a folder or disk to begin."
   @Published var errorMessage: String?
@@ -67,6 +69,7 @@ final class AppModel: ObservableObject {
   private(set) var store: ScanStore?
   private var scanner: DiskScanner?
   private var scanTask: Task<Void, Never>?
+  private var exportTask: Task<Void, Never>?
   private var overviewTask: Task<FastOverviewResult, Never>?
   private var activeSecurityScopedURL: URL?
   private var loadedDirectoryIDs = Set<Int64>()
@@ -580,7 +583,7 @@ final class AppModel: ObservableObject {
   func cancelDuplicates() { Task { await duplicateFinder.cancel() } }
 
   func export(format: ExportFormat, privacy: PrivacyMode, scope: ExportScope = .entireScan) {
-    guard let store, let scanID = currentScan?.id else { return }
+    guard !isExporting, let store, let scanID = currentScan?.id else { return }
     let panel = NSSavePanel()
     panel.canCreateDirectories = true
     switch format {
@@ -590,8 +593,14 @@ final class AppModel: ObservableObject {
     case .aiReport: panel.nameFieldStringValue = "ai-report.json"
     }
     guard panel.runModal() == .OK, let url = panel.url else { return }
+    isExporting = true
+    exportProgress = ExportProgress(exportedItems: 0, bytesWritten: 0)
     statusMessage = "Exporting…"
-    Task {
+    exportTask = Task {
+      defer {
+        isExporting = false
+        exportTask = nil
+      }
       do {
         let exporter = ScanExporter(store: store)
         try await exporter.export(
@@ -603,14 +612,25 @@ final class AppModel: ObservableObject {
             aggregateDepth: aiAggregateDepth
           )
         ) { [weak self] update in
-          await MainActor.run { self?.statusMessage = "Exported \(update.exportedItems) items…" }
+          await MainActor.run {
+            self?.exportProgress = update
+            self?.statusMessage = "Exported \(update.exportedItems) items…"
+          }
         }
         statusMessage = "Export saved to \(url.lastPathComponent)."
+      } catch is CancellationError {
+        statusMessage = "Export cancelled."
       } catch {
         errorMessage = error.localizedDescription
         statusMessage = "Export failed."
       }
     }
+  }
+
+  func cancelExport() {
+    guard isExporting else { return }
+    statusMessage = "Cancelling export…"
+    exportTask?.cancel()
   }
 
   func saveRules(_ rules: [CleanupRule]) {

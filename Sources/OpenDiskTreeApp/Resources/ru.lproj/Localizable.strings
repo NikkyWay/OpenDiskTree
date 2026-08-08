@@ -24,6 +24,8 @@
 "Logical" = "Логический";
 "Duplicates" = "Дубликаты";
 "Export" = "Экспорт";
+"export.progress" = "Экспортировано элементов:";
+"export.cancel" = "Отменить экспорт";
 "Privacy" = "Приватность";
 "Full paths" = "Полные пути";
 "Hide home and volume" = "Скрыть пользователя и том";
