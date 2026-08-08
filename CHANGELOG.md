@@ -10,6 +10,7 @@ All notable changes to OpenDiskTree are recorded here.
 - Keep global query indexes in place across snapshots, avoiding a full retained-history index rebuild before and after every scan.
 - Publish a completed snapshot before pruning old history; multi-million-row cascade deletion now runs transactionally on a background WAL connection.
 - Disable foreground WAL auto-checkpoints during a scan; checkpoint and truncate the scan log during background retention maintenance after results are visible.
+- Give SQLite a bounded metadata page cache and memory-map read-only index pages, avoiding repeated SSD reads while large retained B-trees are updated.
 - Reclaim abandoned `running` snapshots and obsolete partial snapshots left by terminated older builds during background retention cleanup.
 - Compute directory sizes and safety states in one in-memory bottom-up pass, replacing one SQL table scan per path depth during finalization.
 - Reuse the previous directory rollup during incremental scans, avoiding the old full-table aggregation after unchanged subtrees are copied.

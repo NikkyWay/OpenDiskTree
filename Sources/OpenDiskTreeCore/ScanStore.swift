@@ -331,6 +331,8 @@ public actor ScanStore {
       let connection = try SQLiteConnection(url: databaseURL)
       try connection.execute("PRAGMA foreign_keys=ON")
       try connection.execute("PRAGMA busy_timeout=30000")
+      try connection.execute("PRAGMA cache_size=-131072")
+      try connection.execute("PRAGMA mmap_size=268435456")
       try connection.execute("BEGIN IMMEDIATE")
       do {
         // A new process cannot resume a transaction owned by a previous app
@@ -1049,6 +1051,8 @@ public actor ScanStore {
       PRAGMA synchronous=NORMAL;
       PRAGMA foreign_keys=ON;
       PRAGMA temp_store=MEMORY;
+      PRAGMA cache_size=-262144;
+      PRAGMA mmap_size=536870912;
       CREATE TABLE IF NOT EXISTS scans(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         root_path TEXT NOT NULL,
