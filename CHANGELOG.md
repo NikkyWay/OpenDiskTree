@@ -2,6 +2,13 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.2.0 — 2026-08-09
+
+- Sample scanner pause/cancel state every 256 entries instead of paying an actor hop for every metadata row.
+- Use keyset pagination for large JSON, CSV and SQLite exports.
+- Make the folder outline load descendants only when a directory is expanded.
+- Export a relational SQLite schema with scans, volumes, rules, errors and duplicate foreign keys.
+
 ## 1.1.1 — 2026-08-07
 
 - Do not carry duplicate-group IDs between snapshots when copying unchanged subtrees; duplicate groups are always scoped to the snapshot that calculated them.

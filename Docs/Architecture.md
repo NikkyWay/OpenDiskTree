@@ -20,6 +20,8 @@ The optimization is never allowed to silently return stale data. The app require
 
 Duplicate hashing and export are explicit secondary jobs. They page through SQLite independently of the scanner. Hashing refuses iCloud placeholders unless the user accepts the download risk.
 
+Exports use keyset pagination by `(scan_id,id)` for complete and filtered scopes instead of repeatedly increasing `OFFSET`; this keeps JSON, CSV and SQLite export time close to linear as snapshots grow.
+
 File actions re-read device and inode identity before using the macOS Trash API. This prevents an item replaced after the scan from being acted on under stale metadata. There is deliberately no permanent-delete function or privileged helper.
 
 Scanner work is wrapped in a Points of Interest signpost named `Disk scan`, so Instruments can correlate traversal time with filesystem and UI activity. `Scripts/benchmark.sh` feeds one million bounded batches through the same SQLite insertion and aggregation path by default; CI uses a smaller 20,000-row run while still exercising the identical code.

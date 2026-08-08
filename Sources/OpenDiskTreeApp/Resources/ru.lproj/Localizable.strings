@@ -4,6 +4,10 @@
 "scan.pause" = "Пауза";
 "scan.resume" = "Продолжить";
 "scan.cancel" = "Отменить";
+"scan.fastUpdate" = "Быстро обновить текущий скан";
+"scan.fullRescan" = "Полный перескан с нуля";
+"scan.fastUpdate.short" = "Быстрое обновление";
+"scan.full.short" = "Полный скан";
 "action.reveal" = "Показать в Finder";
 "action.trash" = "Переместить в Корзину";
 "status.safe_to_delete" = "Безопасно удалить";

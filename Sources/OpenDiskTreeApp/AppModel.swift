@@ -69,6 +69,7 @@ final class AppModel: ObservableObject {
   private var scanTask: Task<Void, Never>?
   private var overviewTask: Task<FastOverviewResult, Never>?
   private var activeSecurityScopedURL: URL?
+  private var loadedDirectoryIDs = Set<Int64>()
   private let bookmarkDefaultsKey = "securityScopedScanBookmarks"
   private let duplicateFinder = DuplicateFinder()
   private let changeJournal = FSEventsChangeJournal()
@@ -154,6 +155,7 @@ final class AppModel: ObservableObject {
     selectedItem = nil
     items = []
     directoryItems = []
+    loadedDirectoryIDs.removeAll(keepingCapacity: true)
     progress = ScanProgress(currentPath: url.path)
     statusMessage = "Quick overview…"
     scanTask = Task {
@@ -375,6 +377,7 @@ final class AppModel: ObservableObject {
     currentParentID = 1
     navigationStack = []
     selectedItem = nil
+    loadedDirectoryIDs.removeAll(keepingCapacity: true)
     Task { try? await reloadResults() }
   }
 
@@ -419,6 +422,7 @@ final class AppModel: ObservableObject {
         let topLevel = try await store.fetchChildren(
           scanID: scanID, parentID: 1, sort: .allocatedSize, limit: 2_000)
         loadedDirectories = [root] + topLevel.filter(\.kind.canHaveChildren)
+        loadedDirectoryIDs.insert(root.id)
       } else {
         loadedDirectories = []
       }
@@ -434,6 +438,27 @@ final class AppModel: ObservableObject {
   }
 
   func applyFilter() { Task { try? await reloadResults() } }
+
+  /// NSOutlineView asks for children only when a row is expanded. This keeps
+  /// startup and steady-state memory bounded even for a root with hundreds of
+  /// thousands of directories.
+  func loadDirectoryChildren(_ item: ScannedItem) {
+    guard !isPreliminary, item.kind.canHaveChildren, item.scanID > 0,
+      let store, loadedDirectoryIDs.insert(item.id).inserted
+    else { return }
+    Task {
+      do {
+        let children = try await store.fetchChildren(
+          scanID: item.scanID, parentID: item.id, sort: .allocatedSize, limit: 2_000)
+          .filter(\.kind.canHaveChildren)
+        let existingIDs = Set(directoryItems.map(\.id))
+        directoryItems.append(contentsOf: children.filter { !existingIDs.contains($0.id) })
+      } catch {
+        loadedDirectoryIDs.remove(item.id)
+        errorMessage = error.localizedDescription
+      }
+    }
+  }
 
   func showLargestItems() {
     guard currentScan != nil, !isScanning else { return }

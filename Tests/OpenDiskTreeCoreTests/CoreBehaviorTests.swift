@@ -1,4 +1,5 @@
 import Foundation
+import CSQLite
 import Testing
 
 @testable import OpenDiskTreeCore
@@ -251,6 +252,23 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   #expect(result.groups.count == 1)
   #expect(result.groups[0].itemIDs.count == 2)
   #expect(!result.groups[0].sha256.isEmpty)
+
+  let exportedSQLite = workspace.url.appendingPathComponent("duplicates-export.sqlite")
+  try await ScanExporter(store: store).export(
+    scanID: scan.id, to: exportedSQLite, options: ExportOptions(format: .sqlite, privacy: .strict))
+  var handle: OpaquePointer?
+  #expect(sqlite3_open_v2(exportedSQLite.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
+  defer { if let handle { sqlite3_close(handle) } }
+  var statement: OpaquePointer?
+  #expect(sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM duplicate_groups", -1, &statement, nil) == SQLITE_OK)
+  defer { if let statement { sqlite3_finalize(statement) } }
+  #expect(sqlite3_step(statement) == SQLITE_ROW)
+  #expect(sqlite3_column_int(statement, 0) == 1)
+  sqlite3_finalize(statement)
+  statement = nil
+  #expect(sqlite3_prepare_v2(handle, "PRAGMA integrity_check", -1, &statement, nil) == SQLITE_OK)
+  #expect(sqlite3_step(statement) == SQLITE_ROW)
+  #expect(String(cString: sqlite3_column_text(statement, 0)) == "ok")
 }
 
 @Test func exportsAreReadableAndStrictReportHidesNames() async throws {

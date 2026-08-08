@@ -107,7 +107,7 @@ struct ContentView: View {
               HStack {
                 Text(HumanFormat.size(scan.allocatedBytes))
                 Spacer()
-                Text(scan.mode == .incremental ? "Fast update" : "Full scan")
+                Text(scan.mode == .incremental ? String(localized: "scan.fastUpdate.short") : String(localized: "scan.full.short"))
                 Text(scan.startedAt, style: .relative)
               }.font(.caption).foregroundStyle(.secondary)
             }
@@ -185,8 +185,8 @@ struct ContentView: View {
             Button("Scan Full Disk", action: model.scanFullDisk)
             if model.currentScan != nil {
               Divider()
-              Button("Fast update current scan", action: { model.repeatCurrentScan(mode: .incremental) })
-              Button("Full rescan from scratch", action: { model.repeatCurrentScan(mode: .full) })
+              Button(String(localized: "scan.fastUpdate"), action: { model.repeatCurrentScan(mode: .incremental) })
+              Button(String(localized: "scan.fullRescan"), action: { model.repeatCurrentScan(mode: .full) })
             }
           } label: {
             Label("New scan", systemImage: "plus.magnifyingglass")
@@ -290,7 +290,8 @@ struct ContentView: View {
       DirectoryOutlineView(
         items: model.directoryItems, selectedID: model.currentParentID,
         isScanning: model.isScanning,
-        onSelect: model.navigateFromTree
+        onSelect: model.navigateFromTree,
+        onExpand: model.loadDirectoryChildren
       )
       .frame(minWidth: 150, idealWidth: 185, maxWidth: 235, maxHeight: .infinity)
       VSplitView {

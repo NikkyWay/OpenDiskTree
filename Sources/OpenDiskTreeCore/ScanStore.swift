@@ -556,6 +556,35 @@ public actor ScanStore {
     }
   }
 
+  /// Keyset-paginated export query. OFFSET becomes increasingly expensive for
+  /// multi-million-row snapshots because SQLite must walk every skipped row on
+  /// every page. IDs are monotonic within a snapshot, so exports can seek
+  /// directly to the next page for the common full/filter scopes.
+  public func fetchItemsPageAfterID(
+    scanID: Int64,
+    scope: ExportScope,
+    afterID: Int64,
+    limit: Int = 5_000
+  ) throws -> [ScannedItem] {
+    switch scope {
+    case .entireScan, .filtered:
+      var clauses = ["scan_id=?", "is_deleted=0", "id>?"]
+      var values: [SQLValue] = [.integer(scanID), .integer(afterID)]
+      if case .filtered(let filter) = scope {
+        append(filter: filter, clauses: &clauses, values: &values)
+      }
+      values.append(.integer(Int64(limit)))
+      let sql = Self.itemSelect
+        + " WHERE \(clauses.joined(separator: " AND ")) ORDER BY id ASC LIMIT ?"
+      return try queryItems(sql: sql, values: values)
+    case .selection:
+      // Selection scopes need their path-prefix predicates and are normally
+      // much smaller; retain the existing implementation until their IDs are
+      // materialized into a temporary scope table.
+      return try fetchItemsPage(scanID: scanID, scope: scope, limit: limit, offset: 0)
+    }
+  }
+
   public func summary(scanID: Int64, topFileLimit: Int = 500, topDirectoryLimit: Int = 200) throws
     -> StoreSummary
   {

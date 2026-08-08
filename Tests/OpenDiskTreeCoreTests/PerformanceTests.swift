@@ -83,6 +83,12 @@ func sqlitePersistenceBenchmark() async throws {
   let completed = try await store.fetchScan(scan.id)
   #expect(completed?.itemCount == Int64(itemCount + 1))
   #expect(completed?.allocatedBytes == UInt64(itemCount) * 4_096)
+  let firstPage = try await store.fetchItemsPageAfterID(
+    scanID: scan.id, scope: .entireScan, afterID: 0, limit: 100)
+  let secondPage = try await store.fetchItemsPageAfterID(
+    scanID: scan.id, scope: .entireScan, afterID: firstPage.last?.id ?? 0, limit: 100)
+  #expect(firstPage.count == min(100, itemCount + 1))
+  #expect(secondPage.first?.id == firstPage.last.map { $0.id + 1 })
   #expect(elapsed < .seconds(itemCount >= 1_000_000 ? 300 : 15))
   print("Persisted \(itemCount.formatted()) metadata rows in \(elapsed)")
 }

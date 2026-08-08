@@ -7,6 +7,7 @@ struct DirectoryOutlineView: NSViewRepresentable {
   let selectedID: Int64?
   let isScanning: Bool
   let onSelect: (ScannedItem) -> Void
+  let onExpand: (ScannedItem) -> Void
 
   func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -113,7 +114,14 @@ struct DirectoryOutlineView: NSViewRepresentable {
     }
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
-      !((item as? DirectoryNode)?.children.isEmpty ?? true)
+      (item as? DirectoryNode)?.item.kind.canHaveChildren == true
+    }
+
+    func outlineViewItemWillExpand(_ notification: Notification) {
+      guard let node = notification.userInfo?.values.compactMap({ $0 as? DirectoryNode }).first else {
+        return
+      }
+      parent.onExpand(node.item)
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any)

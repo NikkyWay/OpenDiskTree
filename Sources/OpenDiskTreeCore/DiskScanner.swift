@@ -194,8 +194,18 @@ public final class DiskScanner: Sendable {
         guard let listing = outcome.listing else { continue }
         if listing.usedBulkAPI { bulkCount += 1 } else { fallbackCount += 1 }
 
+        var entriesSinceCheckpoint = 0
         for entry in listing.entries {
-          guard await control.checkpoint() else { break }
+          // Checking an actor for every directory entry is disproportionately
+          // expensive on metadata-heavy trees. Task cancellation remains cheap
+          // per item; pause/cancel actor state is sampled often enough to stay
+          // responsive without turning the hot path into millions of awaits.
+          guard !Task.isCancelled else { break }
+          entriesSinceCheckpoint += 1
+          if entriesSinceCheckpoint >= 256 {
+            entriesSinceCheckpoint = 0
+            guard await control.checkpoint() else { break }
+          }
           let path =
             outcome.directory.path == "/"
             ? "/\(entry.name)" : "\(outcome.directory.path)/\(entry.name)"
