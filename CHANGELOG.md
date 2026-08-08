@@ -2,6 +2,17 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.3.0 — 2026-08-09
+
+- Replace barrier-based directory batches with a continuous bounded worker pool, so one slow or protected directory no longer stalls every metadata reader.
+- Raise balanced and turbo metadata concurrency for APFS while keeping the worker count bounded.
+- Pipeline SQLite writes behind the scanner with ordered backpressure instead of stopping directory discovery for every transaction batch.
+- Compute directory sizes and safety states in one in-memory bottom-up pass, replacing one SQL table scan per path depth during finalization.
+- Reuse the previous directory rollup during incremental scans, avoiding the old full-table aggregation after unchanged subtrees are copied.
+- Compile cleanup-rule paths once and classify suffix rules using the extension already returned by the native reader.
+- Parse `getattrlistbulk` records from their returned attribute bitmap so optional metadata cannot misalign the rest of a record.
+- Add a reproducible real-filesystem benchmark. On the development Mac, a 1.96-million-item `/` traversal took 19.8 seconds and a clean SQLite snapshot including finalization took 27.3 seconds, down from 431 seconds in the previous installed build.
+
 ## 1.2.3 — 2026-08-09
 
 - Make SQLite rule export resilient when a user rule intentionally uses the same ID as a built-in rule.

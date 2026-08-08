@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BENCHMARK_ROOT=${1:-/}
+BENCHMARK_INTENSITY=${2:-balanced}
+
+cd "$PROJECT_DIR"
+OPENDISKTREE_BENCHMARK_ROOT="$BENCHMARK_ROOT" \
+OPENDISKTREE_BENCHMARK_STORE=1 \
+OPENDISKTREE_BENCHMARK_INTENSITY="$BENCHMARK_INTENSITY" \
+swift test --filter realFilesystemTraversalBenchmark
