@@ -310,6 +310,16 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   let firstChildren = try await store.fetchChildren(
     scanID: first.id, parentID: 1, sort: .name)
   let stableItem = try #require(firstChildren.first { $0.name == "stable" })
+  try await store.insert(errors: [
+    ScanErrorRecord(
+      scanID: first.id, path: stableItem.path, code: EACCES,
+      message: "Permission denied")
+  ])
+  let reuseCatalog = try await store.makeReuseCatalog(scanID: first.id)
+  #expect(
+    reuseCatalog.match(
+      candidate: stableItem,
+      changedPaths: [stableItem.path + "/keep.bin"]) != nil)
 
   let overlay = try await store.beginScan(
     rootURL: workspace.url, intensity: .turbo, mode: .incremental)

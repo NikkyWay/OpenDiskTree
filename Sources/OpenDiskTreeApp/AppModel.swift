@@ -78,6 +78,7 @@ final class AppModel: ObservableObject {
   private let bookmarkDefaultsKey = "securityScopedScanBookmarks"
   private let journalDefaultsKey = "fseventsBaselineIDs"
   private let duplicateFinder = DuplicateFinder()
+  private let automaticIncrementalPathLimit = 25_000
   private let changeJournal: FSEventsChangeJournal
   private var journalBaselineIDs: [String: UInt64]
 
@@ -196,7 +197,10 @@ final class AppModel: ObservableObject {
         let mode: ScanMode
         if requestedMode == .full {
           mode = .full
-        } else if incrementalAllowed {
+        } else if incrementalAllowed
+          && (requestedMode == .incremental
+            || journalSnapshot.paths.count <= automaticIncrementalPathLimit)
+        {
           mode = .incremental
         } else {
           mode = .full
@@ -205,6 +209,9 @@ final class AppModel: ObservableObject {
               journalSnapshot.complete
               ? "Быстрый повторный скан недоступен: непрерывный журнал ещё не создан. Выполните полный скан один раз."
               : "Быстрый повторный скан недоступен: macOS сообщила о потерянных событиях."
+          } else if incrementalAllowed {
+            statusMessage =
+              "Large change set detected — using a faster clean Turbo scan…"
           }
         }
         // Keep this sorted once for the whole scan. Subtree reuse can then

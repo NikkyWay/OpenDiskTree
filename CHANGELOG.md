@@ -12,6 +12,7 @@ All notable changes to OpenDiskTree are recorded here.
 - Publish the updated base snapshot before cascading through the temporary overlay; its rows are hidden immediately and reclaimed by idle maintenance.
 - Preserve the previous contents of a directory when a fast update cannot read it, instead of interpreting a transient permission or I/O error as deletion.
 - Deduplicate recursive tombstone traversal and skip already hidden rows, preventing repeated descendant walks during large catch-up updates.
+- Automatically choose a clean Turbo scan when FSEvents contains more than 25,000 changed paths; broad catch-up overlays can cost more than a fresh metadata traversal.
 - Decouple scanner progress and incremental finalization from SwiftUI layout work, so filesystem traversal never waits for the table or treemap to redraw.
 - Remove obsolete local benchmark and pre-1.3 indexes after validating the active snapshot, reclaiming 16.6 GB on the development Mac.
 - Benchmark a 1.96-million-item full snapshot at 24.15 seconds and an unchanged incremental overlay at 1.66 seconds in the production scanner harness. The installed app's latest full scan completed in 46 seconds; further full-scan profiling remains open work.

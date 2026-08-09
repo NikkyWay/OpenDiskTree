@@ -147,12 +147,14 @@ public struct SubtreeReuseCatalog: Sendable {
   }
 
   fileprivate let entries: [String: Entry]
+  fileprivate let previouslyUnreadablePaths: Set<String>
 
   public var count: Int { entries.count }
 
   public func match(candidate: ScannedItem, changedPaths: [String]) -> ReusedSubtree? {
     guard candidate.kind.canHaveChildren,
-      !sortedPathsContainDescendant(changedPaths, root: candidate.path),
+      (!sortedPathsContainDescendant(changedPaths, root: candidate.path)
+        || previouslyUnreadablePaths.contains(candidate.path)),
       let entry = entries[candidate.path], entry.kind == candidate.kind,
       entry.deviceID == candidate.deviceID, entry.fileID == candidate.fileID,
       entry.modifiedAt == candidate.modifiedAt
@@ -428,18 +430,52 @@ public actor ScanStore {
           AND overlay_child.path=old_child.path
         WHERE overlay_child.id IS NULL AND old_child.is_deleted=0
         """, [.integer(baseScanID), .integer(overlayScanID)])
-      try executeBound(
+      // Path is already indexed by (scan_id,path). Recursive parent traversal
+      // becomes very expensive when an unavailable or removed package contains
+      // tens of thousands of descendants. Collapse nested roots, then tombstone
+      // each subtree with a pair of indexed path operations.
+      let removedPathSQL = """
+        SELECT item.path
+        FROM odt_removed_item_ids AS removed
+        JOIN items AS item ON item.scan_id=? AND item.id=removed.item_id
+        ORDER BY item.path
         """
-        WITH RECURSIVE removed(item_id) AS (
-          SELECT item_id FROM odt_removed_item_ids
-          UNION
-          SELECT child.id FROM items AS child
-          JOIN removed ON child.scan_id=? AND child.parent_id=removed.item_id
-          WHERE child.is_deleted=0
-        )
-        UPDATE items SET is_deleted=1
-        WHERE scan_id=? AND id IN (SELECT item_id FROM removed)
-        """, [.integer(baseScanID), .integer(baseScanID)])
+      let removedPathStatement = try database.prepare(removedPathSQL)
+      defer { sqlite3_finalize(removedPathStatement) }
+      try database.bind(
+        [.integer(baseScanID)], to: removedPathStatement, sql: removedPathSQL)
+      var removedRoots: [String] = []
+      while sqlite3_step(removedPathStatement) == SQLITE_ROW {
+        guard let path = Self.text(removedPathStatement, 0) else { continue }
+        if let previous = removedRoots.last,
+          path == previous || path.hasPrefix(previous.hasSuffix("/") ? previous : previous + "/")
+        {
+          continue
+        }
+        removedRoots.append(path)
+      }
+      if !removedRoots.isEmpty {
+        let exactSQL =
+          "UPDATE items SET is_deleted=1 WHERE scan_id=? AND path=? AND is_deleted=0"
+        let rangeSQL =
+          "UPDATE items SET is_deleted=1 WHERE scan_id=? AND path>=? AND path<? AND is_deleted=0"
+        let exactStatement = try database.prepare(exactSQL)
+        let rangeStatement = try database.prepare(rangeSQL)
+        defer {
+          sqlite3_finalize(exactStatement)
+          sqlite3_finalize(rangeStatement)
+        }
+        for root in removedRoots {
+          try database.bind(
+            [.integer(baseScanID), .text(root)], to: exactStatement, sql: exactSQL)
+          try database.stepDone(exactStatement, sql: exactSQL)
+          let prefix = root.hasSuffix("/") ? root : root + "/"
+          try database.bind(
+            [.integer(baseScanID), .text(prefix), .text(prefix + "\u{10FFFF}")],
+            to: rangeStatement, sql: rangeSQL)
+          try database.stepDone(rangeStatement, sql: rangeSQL)
+        }
+      }
 
       // Refresh rows whose paths still exist. IDs remain stable, which keeps
       // parent references and Finder/UI selections valid.
@@ -691,6 +727,14 @@ public actor ScanStore {
   }
 
   public func makeReuseCatalog(scanID: Int64) throws -> SubtreeReuseCatalog {
+    let errorSQL = "SELECT path FROM scan_errors WHERE scan_id=?"
+    let errorStatement = try database.prepare(errorSQL)
+    defer { sqlite3_finalize(errorStatement) }
+    try database.bind([.integer(scanID)], to: errorStatement, sql: errorSQL)
+    var previouslyUnreadablePaths = Set<String>()
+    while sqlite3_step(errorStatement) == SQLITE_ROW {
+      if let path = Self.text(errorStatement, 0) { previouslyUnreadablePaths.insert(path) }
+    }
     let sql = """
       SELECT item.id,item.path,item.kind,item.modified_at,item.device_id,item.file_id,
         item.logical_bytes,item.allocated_bytes,item.safety_status,item.rule_id,item.reason,
@@ -731,7 +775,8 @@ public actor ScanStore {
           sourceApplication: Self.text(statement, 12),
           isProtectedRule: sqlite3_column_int(statement, 13) != 0))
     }
-    return SubtreeReuseCatalog(entries: entries)
+    return SubtreeReuseCatalog(
+      entries: entries, previouslyUnreadablePaths: previouslyUnreadablePaths)
   }
 
   /// Reuses an unchanged directory from a previous snapshot. Materialized
