@@ -1,6 +1,6 @@
 "app.name" = "OpenDiskTree";
 "scan.folder" = "Сканировать папку";
-"scan.disk" = "Сканировать весь диск";
+"scan.disk" = "Сканировать или обновить диск";
 "scan.pause" = "Пауза";
 "scan.resume" = "Продолжить";
 "scan.cancel" = "Отменить";

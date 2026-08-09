@@ -192,7 +192,7 @@ struct ContentView: View {
           }
           Menu {
             Button("Scan Folder", action: model.chooseFolder)
-            Button("Scan Full Disk", action: model.scanFullDisk)
+            Button(String(localized: "scan.disk"), action: model.scanFullDisk)
             if model.currentScan != nil {
               Divider()
               Button(String(localized: "scan.fastUpdate"), action: { model.repeatCurrentScan(mode: .incremental) })

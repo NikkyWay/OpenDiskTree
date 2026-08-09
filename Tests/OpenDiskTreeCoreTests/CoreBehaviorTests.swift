@@ -203,7 +203,13 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   let stable = workspace.url.appendingPathComponent("stable", isDirectory: true)
   try FileManager.default.createDirectory(
     at: stable.appendingPathComponent("nested"), withIntermediateDirectories: true)
-  try write(String(repeating: "stable", count: 400), to: stable.appendingPathComponent("data.bin"))
+  let stableFile = stable.appendingPathComponent("data.bin")
+  try write(String(repeating: "stable", count: 400), to: stableFile)
+  // The unchanged subtree contains one side of a hard link while the other
+  // side is enumerated again at the root. Reuse must remain fast without
+  // counting the same physical blocks twice.
+  try FileManager.default.linkItem(
+    at: stableFile, to: workspace.url.appendingPathComponent("linked-copy.bin"))
   let databaseURL = FileManager.default.temporaryDirectory.appendingPathComponent(
     "OpenDiskTree-incremental-\(UUID().uuidString).sqlite")
   defer { try? FileManager.default.removeItem(at: databaseURL) }
@@ -232,6 +238,119 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   #expect(finished.reusedItemCount == result.reusedItemCount)
   #expect(finished.itemCount == first.itemCount)
   #expect(finished.allocatedBytes == first.allocatedBytes)
+}
+
+@Test func incrementalOverlayPatchesExistingSnapshotWithoutCopyingUnchangedRows() async throws {
+  let workspace = try TestWorkspace()
+  defer { workspace.remove() }
+  let stable = workspace.url.appendingPathComponent("stable", isDirectory: true)
+  try FileManager.default.createDirectory(at: stable, withIntermediateDirectories: true)
+  try write(String(repeating: "unchanged", count: 300), to: stable.appendingPathComponent("keep.bin"))
+  let changing = workspace.url.appendingPathComponent("changing.bin")
+  let removed = workspace.url.appendingPathComponent("removed.bin")
+  let added = workspace.url.appendingPathComponent("added.bin")
+  try write("before", to: changing)
+  try write("remove me", to: removed)
+
+  let databaseURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+    "OpenDiskTree-overlay-\(UUID().uuidString).sqlite")
+  defer { try? FileManager.default.removeItem(at: databaseURL) }
+  let (store, first) = try await scanFixture(workspace.url, databaseURL: databaseURL)
+
+  try write(String(repeating: "after", count: 500), to: changing)
+  try FileManager.default.removeItem(at: removed)
+  try write("new", to: added)
+
+  let reuseCatalog = try await store.makeReuseCatalog(scanID: first.id)
+  #expect(reuseCatalog.count > 0)
+  let overlay = try await store.beginScan(
+    rootURL: workspace.url, intensity: .turbo, mode: .incremental)
+  let root = try DiskScanner.makeRootItem(scanID: overlay.id, id: 1, url: workspace.url)
+  try await store.insert([root])
+  let previousMaximum = try await store.maximumItemID(scanID: first.id)
+  let changedPaths = [added.path, changing.path, removed.path].sorted()
+  let result = try await DiskScanner().scan(
+    scanID: overlay.id, rootItemID: 1,
+    options: ScanOptions(
+      rootURL: workspace.url, intensity: .turbo, mode: .incremental,
+      startingItemID: previousMaximum + 1),
+    onBatch: { items, _ in try await store.insert(items) },
+    onErrors: { errors in try await store.insert(errors: errors) },
+    reuseCatalog: reuseCatalog,
+    changedPaths: changedPaths)
+  let updated = try await store.finishIncrementalOverlay(
+    baseScanID: first.id, overlayScanID: overlay.id, result: result)
+
+  #expect(result.reusedItemCount > 0)
+  #expect(updated.id == first.id)
+  #expect(updated.mode == .incremental)
+  #expect(try await store.recentScans().count == 1)
+  let hiddenOverlay = try await store.fetchScan(overlay.id)
+  #expect(hiddenOverlay?.state == .cancelled)
+  #expect(hiddenOverlay?.itemCount == -1)
+  let children = try await store.fetchChildren(scanID: first.id, parentID: 1, sort: .name)
+  #expect(children.contains { $0.name == "stable" })
+  #expect(children.contains { $0.name == "changing.bin" && $0.logicalBytes == 2_500 })
+  #expect(children.contains { $0.name == "added.bin" })
+  #expect(!children.contains { $0.name == "removed.bin" })
+  try await store.pruneCompletedHistoryInBackground(rootPath: workspace.url.path)
+  #expect(try await store.fetchScan(overlay.id) == nil)
+}
+
+@Test func transientScanErrorPreservesPreviousSubtree() async throws {
+  let workspace = try TestWorkspace()
+  defer { workspace.remove() }
+  let stable = workspace.url.appendingPathComponent("stable", isDirectory: true)
+  try FileManager.default.createDirectory(at: stable, withIntermediateDirectories: true)
+  try write("keep", to: stable.appendingPathComponent("keep.bin"))
+
+  let databaseURL = workspace.url.appendingPathComponent("transient-error.sqlite")
+  let (store, first) = try await scanFixture(workspace.url, databaseURL: databaseURL)
+  let firstRoot = try #require(await store.fetchItem(scanID: first.id, itemID: 1))
+  let firstChildren = try await store.fetchChildren(
+    scanID: first.id, parentID: 1, sort: .name)
+  let stableItem = try #require(firstChildren.first { $0.name == "stable" })
+
+  let overlay = try await store.beginScan(
+    rootURL: workspace.url, intensity: .turbo, mode: .incremental)
+  let overlayRoot = ScannedItem(
+    id: 1, scanID: overlay.id, parentID: nil, path: firstRoot.path, name: firstRoot.name,
+    depth: firstRoot.depth, kind: firstRoot.kind, fileExtension: firstRoot.fileExtension,
+    ownLogicalBytes: firstRoot.ownLogicalBytes,
+    ownAllocatedBytes: firstRoot.ownAllocatedBytes,
+    accountedAllocatedBytes: firstRoot.accountedAllocatedBytes,
+    logicalBytes: firstRoot.logicalBytes, allocatedBytes: firstRoot.allocatedBytes,
+    createdAt: firstRoot.createdAt, modifiedAt: firstRoot.modifiedAt,
+    deviceID: firstRoot.deviceID, fileID: firstRoot.fileID, linkCount: firstRoot.linkCount,
+    isHidden: firstRoot.isHidden, isPackage: firstRoot.isPackage,
+    classification: firstRoot.classification)
+  let unavailableDirectory = ScannedItem(
+    id: stableItem.id, scanID: overlay.id, parentID: 1, path: stableItem.path,
+    name: stableItem.name, depth: stableItem.depth, kind: stableItem.kind,
+    fileExtension: stableItem.fileExtension,
+    ownLogicalBytes: stableItem.ownLogicalBytes,
+    ownAllocatedBytes: stableItem.ownAllocatedBytes,
+    accountedAllocatedBytes: stableItem.accountedAllocatedBytes,
+    logicalBytes: stableItem.logicalBytes, allocatedBytes: stableItem.allocatedBytes,
+    createdAt: stableItem.createdAt, modifiedAt: stableItem.modifiedAt,
+    deviceID: stableItem.deviceID, fileID: stableItem.fileID, linkCount: stableItem.linkCount,
+    isHidden: stableItem.isHidden, isPackage: stableItem.isPackage,
+    classification: stableItem.classification)
+  try await store.insert([overlayRoot, unavailableDirectory])
+  try await store.insert(errors: [
+    ScanErrorRecord(
+      scanID: overlay.id, path: stableItem.path, code: EACCES,
+      message: "Permission denied")
+  ])
+  let result = ScannerResult(
+    progress: ScanProgress(files: 0, directories: 2), cancelled: false,
+    bulkDirectoryCount: 1, fallbackDirectoryCount: 0, maximumDepth: 1)
+  _ = try await store.finishIncrementalOverlay(
+    baseScanID: first.id, overlayScanID: overlay.id, result: result)
+
+  let preservedChildren = try await store.fetchChildren(
+    scanID: first.id, parentID: stableItem.id, sort: .name)
+  #expect(preservedChildren.contains { $0.name == "keep.bin" })
 }
 
 @Test func duplicateFinderUsesContentNotOnlySize() async throws {

@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 import Foundation
 import OpenDiskTreeCore
 import SwiftUI
@@ -59,7 +60,7 @@ final class AppModel: ObservableObject {
   @Published var lastScanWasIncremental = false
   @Published var incrementalUnavailableReason: String?
 
-  @AppStorage("scanIntensity") private var intensityRaw = ScanIntensity.balanced.rawValue
+  @AppStorage("scanIntensity") private var intensityRaw = ScanIntensity.turbo.rawValue
   @AppStorage("strictDeletion") var strictDeletion = true
   @AppStorage("advancedRuleOverrides") var advancedRuleOverrides = false
   @AppStorage("aiTopFiles") var aiTopFiles = 500
@@ -71,14 +72,28 @@ final class AppModel: ObservableObject {
   private var scanTask: Task<Void, Never>?
   private var exportTask: Task<Void, Never>?
   private var overviewTask: Task<FastOverviewResult, Never>?
+  private var maintenanceTask: Task<Void, Never>?
   private var activeSecurityScopedURL: URL?
   private var loadedDirectoryIDs = Set<Int64>()
   private let bookmarkDefaultsKey = "securityScopedScanBookmarks"
+  private let journalDefaultsKey = "fseventsBaselineIDs"
   private let duplicateFinder = DuplicateFinder()
-  private let changeJournal = FSEventsChangeJournal()
-  private var journalBaselines = Set<String>()
+  private let changeJournal: FSEventsChangeJournal
+  private var journalBaselineIDs: [String: UInt64]
 
   init() {
+    let storedJournalBaselines =
+      UserDefaults.standard.dictionary(forKey: "fseventsBaselineIDs") ?? [:]
+    journalBaselineIDs = storedJournalBaselines.compactMapValues {
+      ($0 as? NSNumber)?.uint64Value
+    }
+    let oldestBaseline = journalBaselineIDs.values.min()
+    let applicationSupport = FileManager.default.urls(
+      for: .applicationSupportDirectory, in: .userDomainMask
+    ).first?.appendingPathComponent("OpenDiskTree", isDirectory: true).path
+    changeJournal = FSEventsChangeJournal(
+      sinceEventID: oldestBaseline ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+      ignoredRootPaths: applicationSupport.map { [$0] } ?? [])
     do {
       store = try ScanStore()
       Task { await bootstrap() }
@@ -89,7 +104,7 @@ final class AppModel: ObservableObject {
   }
 
   var intensity: ScanIntensity {
-    get { ScanIntensity(rawValue: intensityRaw) ?? .balanced }
+    get { ScanIntensity(rawValue: intensityRaw) ?? .turbo }
     set { intensityRaw = newValue.rawValue }
   }
 
@@ -132,7 +147,7 @@ final class AppModel: ObservableObject {
     startScan(url: resolveSecurityScopedBookmark(for: selectedURL) ?? selectedURL)
   }
 
-  func scanFullDisk() { startScan(url: URL(fileURLWithPath: "/", isDirectory: true), mode: .full) }
+  func scanFullDisk() { startScan(url: URL(fileURLWithPath: "/", isDirectory: true)) }
 
   func repeatCurrentScan(mode: ScanMode) {
     guard let currentScan else { return }
@@ -141,6 +156,8 @@ final class AppModel: ObservableObject {
 
   func startScan(url: URL, mode requestedMode: ScanMode? = nil) {
     guard !isScanning, let store else { return }
+    maintenanceTask?.cancel()
+    maintenanceTask = nil
     if (try? url.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) == false {
       errorMessage =
         "Network volumes are not supported. Choose a folder on a local or directly attached disk."
@@ -170,9 +187,11 @@ final class AppModel: ObservableObject {
       }
       do {
         let previous = try await store.latestCompletedScan(rootPath: rootPath)
-        let journalSnapshot = changeJournal.snapshot(for: url)
+        let baselineEventID = journalBaselineIDs[rootPath]
+        let journalSnapshot = changeJournal.snapshot(
+          for: url, sinceEventID: baselineEventID)
         let incrementalAllowed =
-          previous != nil && journalBaselines.contains(rootPath)
+          previous != nil && baselineEventID != nil
           && journalSnapshot.complete && previous?.journalComplete == true
         let mode: ScanMode
         if requestedMode == .full {
@@ -188,17 +207,38 @@ final class AppModel: ObservableObject {
               : "Быстрый повторный скан недоступен: macOS сообщила о потерянных событиях."
           }
         }
-        let changedPaths = mode == .incremental ? journalSnapshot.paths : []
-        let journalGeneration = journalSnapshot.generation
-        isPaused = false
-        let pendingOverview = Task.detached(priority: .userInitiated) {
-          await FastOverviewScanner.scan(rootURL: url)
+        // Keep this sorted once for the whole scan. Subtree reuse can then
+        // check a directory with a binary search instead of walking every
+        // FSEvents path for every directory on disk.
+        let changedPaths = mode == .incremental ? journalSnapshot.paths.sorted() : []
+        if mode == .incremental, changedPaths.isEmpty, let previous {
+          currentScan = previous
+          lastScanWasIncremental = true
+          statusMessage = "Fast update complete — no filesystem changes were recorded."
+          persistJournalBaseline(rootPath: rootPath, eventID: journalSnapshot.latestEventID)
+          try await reloadResults()
+          await loadRecentScans()
+          isScanning = false
+          return
         }
-        overviewTask = pendingOverview
-        Task { [weak self] in
-          let overview = await pendingOverview.value
-          guard let self, self.isScanning, self.currentScan == nil else { return }
-          self.applyFastOverview(overview, rootURL: url)
+        let reuseCatalog: SubtreeReuseCatalog?
+        if mode == .incremental, let previous {
+          statusMessage = "Loading local update index…"
+          reuseCatalog = try await store.makeReuseCatalog(scanID: previous.id)
+        } else {
+          reuseCatalog = nil
+        }
+        isPaused = false
+        if mode == .full {
+          let pendingOverview = Task.detached(priority: .userInitiated) {
+            await FastOverviewScanner.scan(rootURL: url)
+          }
+          overviewTask = pendingOverview
+          Task { [weak self] in
+            let overview = await pendingOverview.value
+            guard let self, self.isScanning, self.currentScan == nil else { return }
+            self.applyFastOverview(overview, rootURL: url)
+          }
         }
 
         statusMessage = "Preparing exact scan…"
@@ -216,8 +256,10 @@ final class AppModel: ObservableObject {
         let root = try DiskScanner.makeRootItem(scanID: record.id, id: 1, url: url, engine: engine)
         try await store.insert([root])
         let batchWriter = ScanBatchWriter(store: store)
-        items = []
-        directoryItems = [root]
+        if mode == .full {
+          items = []
+          directoryItems = [root]
+        }
         let liveRefreshGate = ScanLiveRefreshGate()
 
         let startingID: Int64
@@ -234,56 +276,63 @@ final class AppModel: ObservableObject {
           onBatch: { [weak self] batch, update in
             try await batchWriter.submit(batch)
             let liveItems: [ScannedItem]?
-            if await liveRefreshGate.shouldRefresh() {
+            if mode == .full, await liveRefreshGate.shouldRefresh() {
               liveItems = try await store.fetchChildren(
                 scanID: record.id, parentID: 1, sort: .allocatedSize)
             } else {
               liveItems = nil
             }
-            await MainActor.run {
-              self?.progress = update
-              self?.statusMessage = self?.isPaused == true ? "Scan paused." : "Scanning…"
-              guard self?.currentScan?.id == record.id else { return }
-              guard let liveItems, self?.currentParentID == 1 else { return }
-              self?.items = liveItems
-              self?.directoryItems = [root] + liveItems.filter(\.kind.canHaveChildren)
+            if mode == .full {
+              Task { @MainActor [weak self] in
+                self?.progress = update
+                self?.statusMessage = self?.isPaused == true ? "Scan paused." : "Scanning…"
+                guard self?.currentScan?.id == record.id else { return }
+                guard let liveItems, self?.currentParentID == 1 else { return }
+                self?.items = liveItems
+                self?.directoryItems = [root] + liveItems.filter(\.kind.canHaveChildren)
+              }
             }
           },
           onErrors: { errors in try await store.insert(errors: errors) },
           onProgress: { [weak self] update in
-            await MainActor.run {
+            // The core scan must never wait for a complex SwiftUI layout pass.
+            // Updates are coalesced naturally by the main run loop.
+            Task { @MainActor [weak self] in
               self?.progress = update
-              if self?.isScanning == true { self?.statusMessage = "Scanning…" }
+              if self?.isScanning == true {
+                self?.statusMessage =
+                  mode == .incremental ? "Applying filesystem changes…" : "Scanning…"
+              }
             }
           },
-          onReuseCandidate: { candidate in
-            guard mode == .incremental, let previous else { return nil }
-            return try await store.reuseSubtree(
-              previousScanID: previous.id, newScanID: record.id,
-              candidate: candidate, changedPaths: changedPaths)
-          }
+          reuseCatalog: reuseCatalog,
+          changedPaths: changedPaths
         )
         try await batchWriter.finish()
         statusMessage = "Finalizing scan…"
-        // A full traversal is still a point-in-time snapshot. If macOS reports
-        // a filesystem event while it is running, do not use that snapshot as
-        // the baseline for a fast update; the next request must be full again.
-        let journalComplete =
-          result.journalComplete
-          && changeJournal.generation() == journalGeneration
+        // Commit the event boundary captured before traversal. Events that
+        // arrive while scanning stay queued and are handled by the next fast
+        // update instead of invalidating the complete on-disk index.
+        let journalComplete = result.journalComplete && journalSnapshot.complete
         let finalResult = ScannerResult(
           progress: result.progress, cancelled: result.cancelled,
           bulkDirectoryCount: result.bulkDirectoryCount,
           fallbackDirectoryCount: result.fallbackDirectoryCount,
           maximumDepth: result.maximumDepth,
           reusedItemCount: result.reusedItemCount,
+          reusedPaths: result.reusedPaths,
           journalComplete: journalComplete,
           directoryRollups: result.directoryRollups)
-        currentScan = try await store.finishScan(record.id, result: finalResult)
+        if mode == .incremental, let previous, !finalResult.cancelled {
+          currentScan = try await store.finishIncrementalOverlay(
+            baseScanID: previous.id, overlayScanID: record.id, result: finalResult)
+        } else {
+          currentScan = try await store.finishScan(record.id, result: finalResult)
+        }
         lastScanWasIncremental = mode == .incremental
-        if !finalResult.cancelled && (mode == .full || journalComplete) {
-          changeJournal.resetBaseline()
-          journalBaselines.insert(rootPath)
+        if !finalResult.cancelled && journalComplete {
+          persistJournalBaseline(
+            rootPath: rootPath, eventID: journalSnapshot.latestEventID)
         }
         statusMessage =
           finalResult.cancelled
@@ -294,10 +343,7 @@ final class AppModel: ObservableObject {
         try await reloadResults()
         await loadRecentScans()
         if !finalResult.cancelled {
-          Task {
-            try? await store.pruneCompletedHistoryInBackground(rootPath: rootPath)
-            await loadRecentScans()
-          }
+          scheduleHistoryMaintenance(rootPath: rootPath, store: store)
         }
       } catch {
         if let id = currentScan?.id {
@@ -376,6 +422,30 @@ final class AppModel: ObservableObject {
     else { return nil }
     if isStale { saveSecurityScopedBookmark(for: resolved) }
     return resolved
+  }
+
+  private func persistJournalBaseline(
+    rootPath: String, eventID: FSEventStreamEventId
+  ) {
+    journalBaselineIDs[rootPath] = eventID
+    changeJournal.advanceBaseline(to: eventID)
+    UserDefaults.standard.set(
+      journalBaselineIDs.mapValues { NSNumber(value: $0) },
+      forKey: journalDefaultsKey)
+  }
+
+  private func scheduleHistoryMaintenance(rootPath: String, store: ScanStore) {
+    maintenanceTask?.cancel()
+    maintenanceTask = Task { [weak self] in
+      // A user commonly checks the result and immediately requests an update.
+      // Keep retention out of that interaction window; WAL maintenance is idle work.
+      try? await Task.sleep(for: .seconds(60))
+      guard !Task.isCancelled, let self, !self.isScanning else { return }
+      try? await store.pruneCompletedHistoryInBackground(rootPath: rootPath)
+      guard !Task.isCancelled else { return }
+      await self.loadRecentScans()
+      self.maintenanceTask = nil
+    }
   }
 
   func togglePause() {

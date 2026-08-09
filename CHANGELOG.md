@@ -2,8 +2,33 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
-## 1.3.0 — 2026-08-09
+## 1.3.2 — 2026-08-09
 
+- Apply incremental results directly to the current snapshot instead of copying every unchanged row into another multi-gigabyte snapshot.
+- Preload the compact directory reuse catalog in one sequential query, replacing hundreds of thousands of random SQLite lookups during a fast update.
+- Match reusable directories synchronously and keep them in normal write batches, removing one actor hop and one SQLite flush per unchanged folder.
+- Keep filesystem events that arrive during a scan queued for the next update; ordinary background activity no longer invalidates the index and forces another full traversal.
+- Mark removed branches with lightweight tombstones during the foreground update and reclaim their rows later during idle maintenance.
+- Publish the updated base snapshot before cascading through the temporary overlay; its rows are hidden immediately and reclaimed by idle maintenance.
+- Preserve the previous contents of a directory when a fast update cannot read it, instead of interpreting a transient permission or I/O error as deletion.
+- Deduplicate recursive tombstone traversal and skip already hidden rows, preventing repeated descendant walks during large catch-up updates.
+- Decouple scanner progress and incremental finalization from SwiftUI layout work, so filesystem traversal never waits for the table or treemap to redraw.
+- Remove obsolete local benchmark and pre-1.3 indexes after validating the active snapshot, reclaiming 16.6 GB on the development Mac.
+- Benchmark a 1.96-million-item full snapshot at 24.15 seconds and an unchanged incremental overlay at 1.66 seconds in the production scanner harness. The installed app's latest full scan completed in 46 seconds; further full-scan profiling remains open work.
+
+## 1.3.1 — 2026-08-09
+
+- Make the primary full-disk action choose a journal-backed update when a trustworthy baseline exists; a full rescan remains an explicit separate action.
+- Ignore OpenDiskTree's own SQLite directory in FSEvents, preventing scan writes from invalidating every incremental baseline.
+- Persist the last FSEvents event ID and replay journal changes after relaunch; dropped, wrapped or unavailable history still falls back to a full scan.
+- Return immediately without creating another multi-million-row snapshot when a fast update has no recorded filesystem changes.
+- Store compact per-directory reuse statistics and binary-search the sorted change journal, removing repeated table scans and linear path matching from incremental updates.
+- Reuse hard-link-containing subtrees and reconcile physical-block ownership once at finalization, instead of rescanning most of `/Users`, `/System` and `/Applications`.
+- Delay snapshot retention until the app is idle, so an immediate user-requested update never races a background SQLite writer.
+- Use Turbo for new installations by default; Balanced remains an opt-in low-pressure mode.
+- Measure 1.95 million real filesystem objects in 23.5 seconds end-to-end on the development Mac with the incremental rollup index enabled.
+
+## 1.3.0 — 2026-08-09
 - Replace barrier-based directory batches with a continuous bounded worker pool, so one slow or protected directory no longer stalls every metadata reader.
 - Raise balanced and turbo metadata concurrency for APFS while keeping the worker count bounded.
 - Pipeline SQLite writes behind the scanner with ordered backpressure instead of stopping directory discovery for every transaction batch.

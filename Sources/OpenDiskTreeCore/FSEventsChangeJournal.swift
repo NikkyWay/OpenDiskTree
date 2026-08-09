@@ -22,16 +22,32 @@ public struct ChangeJournalSnapshot: Sendable, Equatable {
 public final class FSEventsChangeJournal: @unchecked Sendable {
   private final class State: @unchecked Sendable {
     let lock = NSLock()
-    var paths = Set<String>()
+    var pathEventIDs: [String: FSEventStreamEventId] = [:]
     var dropped = false
-    var latestEventID: FSEventStreamEventId = FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+    var historyComplete: Bool
+    var latestEventID: FSEventStreamEventId
     var generation: UInt64 = 0
     var stream: FSEventStreamRef?
+    let ignoredRootPaths: [String]
+
+    init(sinceEventID: FSEventStreamEventId, ignoredRootPaths: [String]) {
+      let sinceNow = FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
+      historyComplete = sinceEventID == sinceNow
+      latestEventID = sinceEventID == sinceNow ? FSEventsGetCurrentEventId() : sinceEventID
+      self.ignoredRootPaths = ignoredRootPaths
+    }
 
     func record(path: String, flags: FSEventStreamEventFlags, eventID: FSEventStreamEventId) {
       lock.lock()
       defer { lock.unlock() }
-      paths.insert(path)
+      if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone) != 0 {
+        historyComplete = true
+      }
+      guard !ignoredRootPaths.contains(where: { pathIsEqualOrDescendant(path, of: $0) }) else {
+        latestEventID = max(latestEventID, eventID)
+        return
+      }
+      pathEventIDs[path] = max(pathEventIDs[path] ?? 0, eventID)
       latestEventID = max(latestEventID, eventID)
       generation &+= 1
       let incompleteFlags =
@@ -39,29 +55,53 @@ public final class FSEventsChangeJournal: @unchecked Sendable {
         | FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped)
         | FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped)
         | FSEventStreamEventFlags(kFSEventStreamEventFlagEventIdsWrapped)
+        | FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged)
       if flags & incompleteFlags != 0 { dropped = true }
     }
 
-    func snapshot(rootPath: String) -> ChangeJournalSnapshot {
+    func snapshot(
+      rootPath: String,
+      sinceEventID: FSEventStreamEventId?
+    ) -> ChangeJournalSnapshot {
       lock.lock()
       defer { lock.unlock() }
-      let filtered = Set(paths.filter { pathIsEqualOrDescendant($0, of: rootPath) })
+      let filtered = Set<String>(
+        pathEventIDs.compactMap { path, eventID in
+          guard pathIsEqualOrDescendant(path, of: rootPath),
+            sinceEventID.map({ eventID > $0 }) ?? true
+          else { return nil }
+          return path
+        })
       return ChangeJournalSnapshot(
-        paths: filtered, complete: !dropped, latestEventID: latestEventID, generation: generation)
+        paths: filtered, complete: historyComplete && !dropped,
+        latestEventID: latestEventID, generation: generation)
     }
 
-    func reset() {
+    func advanceBaseline(to eventID: FSEventStreamEventId) {
       lock.lock()
-      paths.removeAll(keepingCapacity: true)
+      // Keep events that arrived after the snapshot being committed. Clearing
+      // the whole map here creates a race where filesystem changes made during
+      // a scan disappear from the next incremental update.
+      pathEventIDs = pathEventIDs.filter { $0.value > eventID }
       dropped = false
+      historyComplete = true
       lock.unlock()
     }
   }
 
   private let state: State
 
-  public init(rootPath: String = "/") {
-    state = State()
+  public init(
+    rootPath: String = "/",
+    sinceEventID: FSEventStreamEventId = FSEventStreamEventId(
+      kFSEventStreamEventIdSinceNow),
+    ignoredRootPaths: [String] = []
+  ) {
+    state = State(
+      sinceEventID: sinceEventID,
+      ignoredRootPaths: ignoredRootPaths.map {
+        URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.path
+      })
     var context = FSEventStreamContext(
       version: 0,
       info: Unmanaged.passUnretained(state).toOpaque(),
@@ -73,6 +113,7 @@ public final class FSEventsChangeJournal: @unchecked Sendable {
     let flags =
       FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents)
       | FSEventStreamCreateFlags(kFSEventStreamCreateFlagNoDefer)
+      | FSEventStreamCreateFlags(kFSEventStreamCreateFlagWatchRoot)
     let callback: FSEventStreamCallback = { _, info, count, rawPaths, rawFlags, rawIDs in
       guard let info else { return }
       let state = Unmanaged<State>.fromOpaque(info).takeUnretainedValue()
@@ -84,7 +125,7 @@ public final class FSEventsChangeJournal: @unchecked Sendable {
       }
     }
     state.stream = FSEventStreamCreate(
-      nil, callback, &context, paths, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.15,
+      nil, callback, &context, paths, sinceEventID, 0.15,
       flags
     )
     if let stream = state.stream {
@@ -100,8 +141,13 @@ public final class FSEventsChangeJournal: @unchecked Sendable {
     FSEventStreamRelease(stream)
   }
 
-  public func snapshot(for rootURL: URL) -> ChangeJournalSnapshot {
-    state.snapshot(rootPath: rootURL.standardizedFileURL.path)
+  public func snapshot(
+    for rootURL: URL,
+    sinceEventID: FSEventStreamEventId? = nil
+  ) -> ChangeJournalSnapshot {
+    state.snapshot(
+      rootPath: rootURL.standardizedFileURL.path,
+      sinceEventID: sinceEventID)
   }
 
   public func generation() -> UInt64 {
@@ -110,7 +156,11 @@ public final class FSEventsChangeJournal: @unchecked Sendable {
     return state.generation
   }
 
-  public func resetBaseline() { state.reset() }
+  /// Commits exactly the event boundary represented by a completed scan.
+  /// Events newer than this boundary remain queued for the next update.
+  public func advanceBaseline(to eventID: FSEventStreamEventId) {
+    state.advanceBaseline(to: eventID)
+  }
 }
 
 private func pathIsEqualOrDescendant(_ path: String, of root: String) -> Bool {

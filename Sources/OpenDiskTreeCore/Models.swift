@@ -294,6 +294,7 @@ public struct ScannerResult: Sendable, Equatable {
   public let fallbackDirectoryCount: Int
   public let maximumDepth: Int
   public let reusedItemCount: Int64
+  public let reusedPaths: [String]
   public let journalComplete: Bool
   public let directoryRollups: [DirectoryRollup]
 
@@ -304,6 +305,7 @@ public struct ScannerResult: Sendable, Equatable {
     fallbackDirectoryCount: Int,
     maximumDepth: Int,
     reusedItemCount: Int64 = 0,
+    reusedPaths: [String] = [],
     journalComplete: Bool = true,
     directoryRollups: [DirectoryRollup] = []
   ) {
@@ -313,6 +315,7 @@ public struct ScannerResult: Sendable, Equatable {
     self.fallbackDirectoryCount = fallbackDirectoryCount
     self.maximumDepth = maximumDepth
     self.reusedItemCount = reusedItemCount
+    self.reusedPaths = reusedPaths
     self.journalComplete = journalComplete
     self.directoryRollups = directoryRollups
   }
@@ -322,17 +325,32 @@ public struct DirectoryRollup: Sendable, Equatable {
   public let itemID: Int64
   public let logicalBytes: UInt64
   public let allocatedBytes: UInt64
+  public let itemCount: Int64
+  public let fileCount: Int64
+  public let directoryCount: Int64
+  public let maximumDepth: Int
+  public let containsHardLinks: Bool
   public let classification: Classification
 
   public init(
     itemID: Int64,
     logicalBytes: UInt64,
     allocatedBytes: UInt64,
+    itemCount: Int64 = 0,
+    fileCount: Int64 = 0,
+    directoryCount: Int64 = 0,
+    maximumDepth: Int = 0,
+    containsHardLinks: Bool = false,
     classification: Classification
   ) {
     self.itemID = itemID
     self.logicalBytes = logicalBytes
     self.allocatedBytes = allocatedBytes
+    self.itemCount = itemCount
+    self.fileCount = fileCount
+    self.directoryCount = directoryCount
+    self.maximumDepth = maximumDepth
+    self.containsHardLinks = containsHardLinks
     self.classification = classification
   }
 }

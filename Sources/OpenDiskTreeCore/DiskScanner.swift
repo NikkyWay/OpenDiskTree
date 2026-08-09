@@ -61,6 +61,7 @@ public struct ReusedSubtree: Sendable, Equatable {
   public let logicalBytes: UInt64
   public let allocatedBytes: UInt64
   public let maximumDepth: Int
+  public let containsHardLinks: Bool
   public let classification: Classification
 
   public init(
@@ -71,6 +72,7 @@ public struct ReusedSubtree: Sendable, Equatable {
     logicalBytes: UInt64,
     allocatedBytes: UInt64,
     maximumDepth: Int,
+    containsHardLinks: Bool,
     classification: Classification
   ) {
     self.itemID = itemID
@@ -80,6 +82,7 @@ public struct ReusedSubtree: Sendable, Equatable {
     self.logicalBytes = logicalBytes
     self.allocatedBytes = allocatedBytes
     self.maximumDepth = maximumDepth
+    self.containsHardLinks = containsHardLinks
     self.classification = classification
   }
 }
@@ -105,6 +108,7 @@ private struct FileIdentity: Hashable, Sendable {
 private struct WorkingDirectoryRollup: Sendable {
   let itemID: Int64
   let parentID: Int64?
+  let depth: Int
   let ownClassification: Classification
   var logicalBytes: UInt64 = 0
   var allocatedBytes: UInt64 = 0
@@ -112,12 +116,35 @@ private struct WorkingDirectoryRollup: Sendable {
   var nonReviewChildren = 0
   var childCount = 0
   var containsProtectedRule = false
+  var itemCount: Int64 = 0
+  var fileCount: Int64 = 0
+  var directoryCount: Int64 = 0
+  var maximumDepth: Int
+  var containsHardLinks = false
   var precomputedClassification: Classification?
+
+  init(
+    itemID: Int64,
+    parentID: Int64?,
+    depth: Int,
+    ownClassification: Classification
+  ) {
+    self.itemID = itemID
+    self.parentID = parentID
+    self.depth = depth
+    self.ownClassification = ownClassification
+    maximumDepth = depth
+  }
 
   mutating func absorb(
     logicalBytes: UInt64,
     allocatedBytes: UInt64,
-    classification: Classification
+    classification: Classification,
+    itemCount: Int64 = 0,
+    fileCount: Int64 = 0,
+    directoryCount: Int64 = 0,
+    maximumDepth: Int? = nil,
+    containsHardLinks: Bool = false
   ) {
     self.logicalBytes &+= logicalBytes
     self.allocatedBytes &+= allocatedBytes
@@ -125,11 +152,21 @@ private struct WorkingDirectoryRollup: Sendable {
     if classification.status != .review { nonReviewChildren += 1 }
     childCount += 1
     containsProtectedRule = containsProtectedRule || classification.isProtectedRule
+    self.itemCount += itemCount
+    self.fileCount += fileCount
+    self.directoryCount += directoryCount
+    self.maximumDepth = max(self.maximumDepth, maximumDepth ?? depth)
+    self.containsHardLinks = self.containsHardLinks || containsHardLinks
   }
 
   mutating func useReusedSubtree(_ subtree: ReusedSubtree) {
     logicalBytes = subtree.logicalBytes
     allocatedBytes = subtree.allocatedBytes
+    itemCount = subtree.itemCount
+    fileCount = subtree.fileCount
+    directoryCount = subtree.directoryCount
+    maximumDepth = subtree.maximumDepth
+    containsHardLinks = subtree.containsHardLinks
     precomputedClassification = subtree.classification
   }
 
@@ -190,8 +227,10 @@ public final class DiskScanner: Sendable {
     onBatch: @Sendable ([ScannedItem], ScanProgress) async throws -> Void,
     onErrors: @Sendable ([ScanErrorRecord]) async throws -> Void,
     onProgress: @Sendable (ScanProgress) async -> Void = { _ in },
+    reuseCatalog: SubtreeReuseCatalog? = nil,
+    changedPaths: [String] = [],
     onReuseCandidate: @Sendable (ScannedItem) async throws -> ReusedSubtree? = { _ in nil },
-    onReuseSubtree: @Sendable (ReusedSubtree, ScannedItem) async throws -> Void = { _, _ in }
+    onReuseSubtree: (@Sendable (ReusedSubtree, ScannedItem) async throws -> Void)? = nil
   ) async throws -> ScannerResult {
     let signpostState = scannerSignposter.beginInterval("Disk scan")
     defer { scannerSignposter.endInterval("Disk scan", signpostState) }
@@ -210,6 +249,7 @@ public final class DiskScanner: Sendable {
     var fallbackCount = 0
     var maximumDepth = 0
     var reusedItemCount: Int64 = 0
+    var reusedPaths: [String] = []
     let collectDirectoryRollups = true
     var directoryOrder: [Int64] = [rootItemID]
     var workingDirectories: [Int64: WorkingDirectoryRollup] = [:]
@@ -218,6 +258,7 @@ public final class DiskScanner: Sendable {
       workingDirectories[rootItemID] = WorkingDirectoryRollup(
         itemID: rootItemID,
         parentID: nil,
+        depth: 0,
         ownClassification: ruleEngine.classify(path: rootPath, kind: .directory)
       )
     }
@@ -330,7 +371,18 @@ public final class DiskScanner: Sendable {
               isPackage: entry.isPackage,
               classification: classification
             )
-            let reuse = isContainer ? try await onReuseCandidate(provisionalItem) : nil
+            let reuse: ReusedSubtree?
+            if isContainer, let reuseCatalog {
+              // Avoid an async hop for every directory in the production
+              // incremental path. The catalog is immutable and safe to match
+              // directly on the scanner coordinator.
+              reuse = reuseCatalog.match(
+                candidate: provisionalItem, changedPaths: changedPaths)
+            } else if isContainer {
+              reuse = try await onReuseCandidate(provisionalItem)
+            } else {
+              reuse = nil
+            }
             let id: Int64
             let item: ScannedItem
             if let reuse {
@@ -363,17 +415,17 @@ public final class DiskScanner: Sendable {
                 workingDirectories[id] = WorkingDirectoryRollup(
                   itemID: id,
                   parentID: outcome.directory.id,
+                  depth: depth,
                   ownClassification: classification
                 )
               }
               progress.directories += 1
               if let reuse {
                 workingDirectories[id]?.useReusedSubtree(reuse)
-                // Flush the parent first: the SQL clone uses its stable ID as the
-                // parent reference for every copied descendant.
-                try await onBatch(bufferedItems, progress)
-                bufferedItems.removeAll(keepingCapacity: true)
-                try await onReuseSubtree(reuse, item)
+                reusedPaths.append(item.path)
+                // An in-place overlay only records this boundary. Keep normal
+                // batching instead of issuing one SQLite call per reused folder.
+                if let onReuseSubtree { try await onReuseSubtree(reuse, item) }
                 reusedItemCount += reuse.itemCount
                 progress.files += reuse.fileCount
                 progress.directories += reuse.directoryCount
@@ -396,7 +448,11 @@ public final class DiskScanner: Sendable {
                 workingDirectories[outcome.directory.id]?.absorb(
                   logicalBytes: ownLogical,
                   allocatedBytes: accountedAllocated,
-                  classification: classification
+                  classification: classification,
+                  itemCount: 1,
+                  fileCount: entry.kind == .file ? 1 : 0,
+                  maximumDepth: depth,
+                  containsHardLinks: entry.linkCount > 1
                 )
               }
               progress.files += 1
@@ -456,13 +512,23 @@ public final class DiskScanner: Sendable {
             itemID: working.itemID,
             logicalBytes: working.logicalBytes,
             allocatedBytes: working.allocatedBytes,
+            itemCount: working.itemCount,
+            fileCount: working.fileCount,
+            directoryCount: working.directoryCount,
+            maximumDepth: working.maximumDepth,
+            containsHardLinks: working.containsHardLinks,
             classification: classification
           ))
         if let parentID = working.parentID {
           workingDirectories[parentID]?.absorb(
             logicalBytes: working.logicalBytes,
             allocatedBytes: working.allocatedBytes,
-            classification: classification
+            classification: classification,
+            itemCount: working.itemCount + 1,
+            fileCount: working.fileCount,
+            directoryCount: working.directoryCount + 1,
+            maximumDepth: working.maximumDepth,
+            containsHardLinks: working.containsHardLinks
           )
         }
       }
@@ -475,6 +541,7 @@ public final class DiskScanner: Sendable {
       fallbackDirectoryCount: fallbackCount,
       maximumDepth: maximumDepth,
       reusedItemCount: reusedItemCount,
+      reusedPaths: reusedPaths,
       journalComplete: true,
       directoryRollups: directoryRollups
     )
