@@ -107,6 +107,7 @@ struct ContentView: View {
               HStack {
                 Text(HumanFormat.size(scan.allocatedBytes))
                 Spacer()
+                Text(scan.mode == .incremental ? String(localized: "scan.fastUpdate.short") : String(localized: "scan.full.short"))
                 Text(scan.startedAt, style: .relative)
               }.font(.caption).foregroundStyle(.secondary)
             }
@@ -179,14 +180,34 @@ struct ContentView: View {
             Label(String(localized: "scan.cancel"), systemImage: "stop.fill")
           }
         } else {
+          if model.isExporting {
+            ProgressView().controlSize(.small)
+            if let progress = model.exportProgress {
+              Text("\(String(localized: "export.progress")) \(progress.exportedItems.formatted())")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Button(String(localized: "export.cancel"), action: model.cancelExport)
+              .buttonStyle(.bordered)
+          }
           Menu {
             Button("Scan Folder", action: model.chooseFolder)
-            Button("Scan Full Disk", action: model.scanFullDisk)
+            Button(String(localized: "scan.disk"), action: model.scanFullDisk)
+            if model.currentScan != nil {
+              Divider()
+              Button(String(localized: "scan.fastUpdate"), action: { model.repeatCurrentScan(mode: .incremental) })
+              Button(String(localized: "scan.fullRescan"), action: { model.repeatCurrentScan(mode: .full) })
+            }
           } label: {
             Label("New scan", systemImage: "plus.magnifyingglass")
           }
           .help("Start a new scan")
           .menuStyle(.borderedButton)
+          if let reason = model.incrementalUnavailableReason, !reason.isEmpty {
+            Image(systemName: "exclamationmark.triangle")
+              .foregroundStyle(.orange)
+              .help(reason)
+          }
           Button(action: model.showLargestItems) {
             Label("Largest files", systemImage: "arrow.down.right.and.arrow.up.left")
           }
@@ -263,7 +284,7 @@ struct ContentView: View {
     } label: {
       Label("Export", systemImage: "square.and.arrow.up")
     }
-    .disabled(model.currentScan == nil || model.isScanning)
+    .disabled(model.currentScan == nil || model.isScanning || model.isExporting)
   }
 
   @ViewBuilder
@@ -279,7 +300,8 @@ struct ContentView: View {
       DirectoryOutlineView(
         items: model.directoryItems, selectedID: model.currentParentID,
         isScanning: model.isScanning,
-        onSelect: model.navigateFromTree
+        onSelect: model.navigateFromTree,
+        onExpand: model.loadDirectoryChildren
       )
       .frame(minWidth: 150, idealWidth: 185, maxWidth: 235, maxHeight: .infinity)
       VSplitView {

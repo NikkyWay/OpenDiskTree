@@ -4,6 +4,12 @@ OpenDiskTree is split into a small native metadata reader, a Swift core module a
 
 SQLite is the live model. Scan batches are committed as they arrive, and views query only the rows they need. A completed snapshot is immutable; cancelled scans remain marked partial and never replace history.
 
+## Incremental index
+
+OpenDiskTree does not parse private APFS on-disk structures. macOS does not provide a stable public equivalent of the Windows NTFS MFT, and reverse-engineering APFS would be fragile around FileVault, snapshots, clones and volume groups. Instead, the completed SQLite snapshot is the app's own metadata index. A public FSEvents stream records changed paths while the app is open. On a fast update, changed branches are enumerated normally and unchanged directory subtrees are copied from the previous snapshot in one SQL operation. IDs are retained for copied rows; new rows use IDs above the previous maximum.
+
+The optimization is never allowed to silently return stale data. The app requires a continuous in-process journal baseline, rejects dropped or wrapped event streams, refuses to reuse a subtree containing hard links, and marks a scan ineligible for the next fast update when events arrive during it. A full rescan from scratch is always available from the toolbar. After an app restart, the first request is full because the in-memory FSEvents coverage window is no longer continuous.
+
 ## Data flow
 
 1. `OpenDiskTreeNative` reads directory names in batches with `getattrlistbulk`; unsupported filesystems fall back to `readdir` and `fstatat`.
@@ -13,6 +19,8 @@ SQLite is the live model. Scan batches are committed as they arrive, and views q
 5. SwiftUI coordinates the application while `NSOutlineView` and `NSTableView` virtualize large result sets. The treemap receives only the current visible slice.
 
 Duplicate hashing and export are explicit secondary jobs. They page through SQLite independently of the scanner. Hashing refuses iCloud placeholders unless the user accepts the download risk.
+
+Exports use keyset pagination by `(scan_id,id)` for complete and filtered scopes instead of repeatedly increasing `OFFSET`; this keeps JSON, CSV and SQLite export time close to linear as snapshots grow.
 
 File actions re-read device and inode identity before using the macOS Trash API. This prevents an item replaced after the scan from being acted on under stale metadata. There is deliberately no permanent-delete function or privileged helper.
 

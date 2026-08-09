@@ -1,9 +1,13 @@
 "app.name" = "OpenDiskTree";
 "scan.folder" = "Scan Folder";
-"scan.disk" = "Scan Full Disk";
+"scan.disk" = "Scan or Update Full Disk";
 "scan.pause" = "Pause";
 "scan.resume" = "Resume";
 "scan.cancel" = "Cancel";
+"scan.fastUpdate" = "Fast update current scan";
+"scan.fullRescan" = "Full rescan from scratch";
+"scan.fastUpdate.short" = "Fast update";
+"scan.full.short" = "Full scan";
 "action.reveal" = "Show in Finder";
 "action.trash" = "Move to Trash";
 "status.safe_to_delete" = "Safe to delete";
@@ -20,6 +24,8 @@
 "Logical" = "Logical";
 "Duplicates" = "Duplicates";
 "Export" = "Export";
+"export.progress" = "Exporting";
+"export.cancel" = "Cancel export";
 "Privacy" = "Privacy";
 "Full paths" = "Full paths";
 "Hide home and volume" = "Hide home and volume";

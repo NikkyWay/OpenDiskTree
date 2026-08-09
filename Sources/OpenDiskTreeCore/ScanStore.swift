@@ -116,6 +116,57 @@ private final class ISO8601FormatterBox: @unchecked Sendable {
   let value = ISO8601DateFormatter()
 }
 
+private struct ReuseStats {
+  let itemCount: Int64
+  let fileCount: Int64
+  let directoryCount: Int64
+  let logicalBytes: UInt64
+  let allocatedBytes: UInt64
+  let maximumDepth: Int
+  let containsHardLinks: Bool
+}
+
+/// An immutable in-memory directory index used by fast updates. Loading it is
+/// one sequential SQLite read; matching during traversal is then a dictionary
+/// lookup instead of hundreds of thousands of random B-tree queries.
+public struct SubtreeReuseCatalog: Sendable {
+  fileprivate struct Entry: Sendable {
+    let itemID: Int64
+    let kind: ItemKind
+    let modifiedAt: Date?
+    let deviceID: UInt64
+    let fileID: UInt64
+    let logicalBytes: UInt64
+    let allocatedBytes: UInt64
+    let itemCount: Int64
+    let fileCount: Int64
+    let directoryCount: Int64
+    let maximumDepth: Int
+    let containsHardLinks: Bool
+    let classification: Classification
+  }
+
+  fileprivate let entries: [String: Entry]
+  fileprivate let previouslyUnreadablePaths: Set<String>
+
+  public var count: Int { entries.count }
+
+  public func match(candidate: ScannedItem, changedPaths: [String]) -> ReusedSubtree? {
+    guard candidate.kind.canHaveChildren,
+      (!sortedPathsContainDescendant(changedPaths, root: candidate.path)
+        || previouslyUnreadablePaths.contains(candidate.path)),
+      let entry = entries[candidate.path], entry.kind == candidate.kind,
+      entry.deviceID == candidate.deviceID, entry.fileID == candidate.fileID,
+      entry.modifiedAt == candidate.modifiedAt
+    else { return nil }
+    return ReusedSubtree(
+      itemID: entry.itemID, itemCount: entry.itemCount, fileCount: entry.fileCount,
+      directoryCount: entry.directoryCount, logicalBytes: entry.logicalBytes,
+      allocatedBytes: entry.allocatedBytes, maximumDepth: entry.maximumDepth,
+      containsHardLinks: entry.containsHardLinks, classification: entry.classification)
+  }
+}
+
 public actor ScanStore {
   // Formatter construction asks ICU to build a locale/time-zone model. Creating it for
   // every timestamp made metadata insertion disproportionately expensive on large scans.
@@ -140,19 +191,21 @@ public actor ScanStore {
     try Self.migrate(database)
   }
 
-  public func beginScan(rootURL: URL, intensity: ScanIntensity) throws -> ScanRecord {
-    // These indexes are only needed for filtering and duplicate queries after a scan.
-    // Maintaining them for every discovered file multiplies random SQLite writes.
-    try database.execute("DROP INDEX IF EXISTS items_path")
-    try database.execute("DROP INDEX IF EXISTS items_status")
-    try database.execute("DROP INDEX IF EXISTS items_duplicate_candidates")
-    try database.execute("DROP INDEX IF EXISTS items_scan_depth")
+  public func beginScan(
+    rootURL: URL,
+    intensity: ScanIntensity,
+    mode: ScanMode = .full
+  ) throws -> ScanRecord {
+    // Query indexes cover every retained snapshot. Dropping them for one new
+    // scan made SQLite rebuild several million historical rows before results
+    // could be shown. The ordered writer pipeline makes maintaining them during
+    // insertion cheaper than a global drop/recreate cycle.
     let values = try rootURL.resourceValues(forKeys: [.volumeNameKey, .volumeUUIDStringKey])
     let volumeName = values.volumeName ?? rootURL.lastPathComponent
     let now = Date()
     let sql = """
-      INSERT INTO scans(root_path, volume_name, volume_uuid, started_at, state, intensity)
-      VALUES(?, ?, ?, ?, ?, ?)
+      INSERT INTO scans(root_path, volume_name, volume_uuid, started_at, state, intensity, scan_mode)
+      VALUES(?, ?, ?, ?, ?, ?, ?)
       """
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
@@ -160,6 +213,7 @@ public actor ScanStore {
       [
         .text(rootURL.path), .text(volumeName), values.volumeUUIDString.map(SQLValue.text) ?? .null,
         .text(Self.dateString(now)), .text(ScanState.running.rawValue), .text(intensity.rawValue),
+        .text(mode.rawValue),
       ], to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     let id = sqlite3_last_insert_rowid(database.handle)
@@ -167,7 +221,8 @@ public actor ScanStore {
     activeStreamingScanID = id
     return ScanRecord(
       id: id, rootPath: rootURL.path, volumeName: volumeName, volumeUUID: values.volumeUUIDString,
-      startedAt: now, finishedAt: nil, state: .running, intensity: intensity,
+      startedAt: now, finishedAt: nil, state: .running, intensity: intensity, mode: mode,
+      reusedItemCount: 0, journalComplete: mode == .full,
       itemCount: 0, logicalBytes: 0, allocatedBytes: 0, inaccessibleCount: 0
     )
   }
@@ -265,9 +320,13 @@ public actor ScanStore {
     -> ScanRecord
   {
     if !result.cancelled {
-      try aggregateDirectories(scanID: scanID, maximumDepth: result.maximumDepth)
+      if result.directoryRollups.isEmpty {
+        try aggregateDirectories(scanID: scanID, maximumDepth: result.maximumDepth)
+      } else {
+        try applyDirectoryRollups(scanID: scanID, rollups: result.directoryRollups)
+      }
+      try reconcileHardLinkAccounting(scanID: scanID)
     }
-    try rebuildDeferredIndexes()
     let state: ScanState = result.cancelled ? .cancelled : .completed
     let finished = Date()
     let root = try fetchItem(scanID: scanID, itemID: rootItemID)
@@ -278,7 +337,7 @@ public actor ScanStore {
       result.cancelled
       ? result.progress.allocatedBytes : (root?.allocatedBytes ?? result.progress.allocatedBytes)
     let sql = """
-      UPDATE scans SET finished_at=?, state=?, item_count=?, logical_bytes=?, allocated_bytes=?, inaccessible_count=?
+      UPDATE scans SET finished_at=?, state=?, item_count=?, logical_bytes=?, allocated_bytes=?, inaccessible_count=?, reused_item_count=?, journal_complete=?
       WHERE id=?
       """
     let statement = try database.prepare(sql)
@@ -289,16 +348,331 @@ public actor ScanStore {
         .integer(result.progress.files + result.progress.directories),
         .unsigned(logicalBytes),
         .unsigned(allocatedBytes),
-        .integer(result.progress.inaccessible), .integer(scanID),
+        .integer(result.progress.inaccessible), .integer(result.reusedItemCount),
+        .integer(result.journalComplete ? 1 : 0), .integer(scanID),
       ], to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     guard let scan = try fetchScan(scanID) else { throw StoreError.missingScan(scanID) }
-    if state == .completed { try pruneCompletedHistory(rootPath: scan.rootPath, keeping: 2) }
+    try ensureQueryIndexes()
     if activeStreamingScanID == scanID {
       try database.execute("COMMIT")
       activeStreamingScanID = nil
     }
     return scan
+  }
+
+  /// Applies a small incremental overlay to the current completed snapshot.
+  /// Unchanged subtrees never receive another set of item rows: only directories
+  /// actually enumerated from FSEvents are reconciled. The base scan ID remains
+  /// stable, keeping every existing UI query and export path fast.
+  public func finishIncrementalOverlay(
+    baseScanID: Int64,
+    overlayScanID: Int64,
+    result: ScannerResult,
+    rootItemID: Int64 = 1
+  ) throws -> ScanRecord {
+    guard !result.cancelled else {
+      return try finishScan(overlayScanID, result: result, rootItemID: rootItemID)
+    }
+    guard activeStreamingScanID == overlayScanID else {
+      throw StoreError.missingScan(overlayScanID)
+    }
+
+    do {
+      if result.directoryRollups.isEmpty {
+        try aggregateDirectories(scanID: overlayScanID, maximumDepth: result.maximumDepth)
+      } else {
+        try applyDirectoryRollups(scanID: overlayScanID, rollups: result.directoryRollups)
+      }
+
+      try database.execute("DROP TABLE IF EXISTS temp.odt_reused_paths")
+      try database.execute(
+        "CREATE TEMP TABLE odt_reused_paths(path TEXT PRIMARY KEY) WITHOUT ROWID")
+      do {
+        let reusedStatement = try database.prepare(
+          "INSERT OR IGNORE INTO odt_reused_paths(path) VALUES(?)")
+        defer { sqlite3_finalize(reusedStatement) }
+        for path in result.reusedPaths {
+          try database.bind([.text(path)], to: reusedStatement, sql: "insert reused path")
+          try database.stepDone(reusedStatement, sql: "insert reused path")
+        }
+      }
+
+      try database.execute("DROP TABLE IF EXISTS temp.odt_enumerated_directories")
+      try database.execute(
+        "CREATE TEMP TABLE odt_enumerated_directories(path TEXT PRIMARY KEY) WITHOUT ROWID")
+      try executeBound(
+        """
+        INSERT INTO odt_enumerated_directories(path)
+        SELECT item.path FROM items AS item
+        WHERE item.scan_id=? AND item.kind IN ('directory','package')
+          AND item.path NOT IN (SELECT path FROM odt_reused_paths)
+          AND NOT EXISTS (
+            SELECT 1 FROM scan_errors AS error
+            WHERE error.scan_id=item.scan_id AND error.path=item.path
+          )
+        """, [.integer(overlayScanID)])
+
+      // If an enumerated directory no longer lists an old immediate child, the
+      // child was deleted or renamed. Remove that child and its descendants.
+      try database.execute("DROP TABLE IF EXISTS temp.odt_removed_item_ids")
+      try database.execute(
+        "CREATE TEMP TABLE odt_removed_item_ids(item_id INTEGER PRIMARY KEY) WITHOUT ROWID")
+      try executeBound(
+        """
+        INSERT INTO odt_removed_item_ids(item_id)
+        SELECT old_child.id
+        FROM odt_enumerated_directories AS enumerated
+        JOIN items AS old_parent ON old_parent.scan_id=? AND old_parent.path=enumerated.path
+        JOIN items AS old_child ON old_child.scan_id=old_parent.scan_id
+          AND old_child.parent_id=old_parent.id
+        LEFT JOIN items AS overlay_child ON overlay_child.scan_id=?
+          AND overlay_child.path=old_child.path
+        WHERE overlay_child.id IS NULL AND old_child.is_deleted=0
+        """, [.integer(baseScanID), .integer(overlayScanID)])
+      // Path is already indexed by (scan_id,path). Recursive parent traversal
+      // becomes very expensive when an unavailable or removed package contains
+      // tens of thousands of descendants. Collapse nested roots, then tombstone
+      // each subtree with a pair of indexed path operations.
+      let removedPathSQL = """
+        SELECT item.path
+        FROM odt_removed_item_ids AS removed
+        JOIN items AS item ON item.scan_id=? AND item.id=removed.item_id
+        ORDER BY item.path
+        """
+      let removedPathStatement = try database.prepare(removedPathSQL)
+      defer { sqlite3_finalize(removedPathStatement) }
+      try database.bind(
+        [.integer(baseScanID)], to: removedPathStatement, sql: removedPathSQL)
+      var removedRoots: [String] = []
+      while sqlite3_step(removedPathStatement) == SQLITE_ROW {
+        guard let path = Self.text(removedPathStatement, 0) else { continue }
+        if let previous = removedRoots.last,
+          path == previous || path.hasPrefix(previous.hasSuffix("/") ? previous : previous + "/")
+        {
+          continue
+        }
+        removedRoots.append(path)
+      }
+      if !removedRoots.isEmpty {
+        let exactSQL =
+          "UPDATE items SET is_deleted=1 WHERE scan_id=? AND path=? AND is_deleted=0"
+        let rangeSQL =
+          "UPDATE items SET is_deleted=1 WHERE scan_id=? AND path>=? AND path<? AND is_deleted=0"
+        let exactStatement = try database.prepare(exactSQL)
+        let rangeStatement = try database.prepare(rangeSQL)
+        defer {
+          sqlite3_finalize(exactStatement)
+          sqlite3_finalize(rangeStatement)
+        }
+        for root in removedRoots {
+          try database.bind(
+            [.integer(baseScanID), .text(root)], to: exactStatement, sql: exactSQL)
+          try database.stepDone(exactStatement, sql: exactSQL)
+          let prefix = root.hasSuffix("/") ? root : root + "/"
+          try database.bind(
+            [.integer(baseScanID), .text(prefix), .text(prefix + "\u{10FFFF}")],
+            to: rangeStatement, sql: rangeSQL)
+          try database.stepDone(rangeStatement, sql: rangeSQL)
+        }
+      }
+
+      // Refresh rows whose paths still exist. IDs remain stable, which keeps
+      // parent references and Finder/UI selections valid.
+      try executeBound(
+        """
+        UPDATE items AS target SET
+          name=source.name,depth=source.depth,kind=source.kind,extension=source.extension,
+          own_logical_bytes=source.own_logical_bytes,
+          own_allocated_bytes=source.own_allocated_bytes,
+          accounted_allocated_bytes=source.accounted_allocated_bytes,
+          logical_bytes=source.logical_bytes,allocated_bytes=source.allocated_bytes,
+          created_at=source.created_at,modified_at=source.modified_at,
+          device_id=source.device_id,file_id=source.file_id,link_count=source.link_count,
+          is_hidden=source.is_hidden,is_package=source.is_package,
+          safety_status=source.safety_status,rule_id=source.rule_id,reason=source.reason,
+          confidence=source.confidence,source_application=source.source_application,
+          is_protected_rule=source.is_protected_rule,duplicate_group_id=NULL,
+          is_deleted=source.is_deleted
+        FROM items AS source
+        WHERE target.scan_id=? AND source.scan_id=? AND target.path=source.path
+        """, [.integer(baseScanID), .integer(overlayScanID)])
+
+      // New rows keep their overlay IDs (allocated above the old maximum). An
+      // existing parent is resolved by path; a new parent keeps its overlay ID.
+      try executeBound(
+        """
+        INSERT INTO items(
+          id,scan_id,parent_id,path,name,depth,kind,extension,
+          own_logical_bytes,own_allocated_bytes,accounted_allocated_bytes,logical_bytes,allocated_bytes,
+          created_at,modified_at,device_id,file_id,link_count,is_hidden,is_package,
+          safety_status,rule_id,reason,confidence,source_application,is_protected_rule,
+          duplicate_group_id,is_deleted
+        )
+        SELECT source.id,?,COALESCE(base_parent.id,source.parent_id),source.path,source.name,
+          source.depth,source.kind,source.extension,source.own_logical_bytes,
+          source.own_allocated_bytes,source.accounted_allocated_bytes,source.logical_bytes,
+          source.allocated_bytes,source.created_at,source.modified_at,source.device_id,
+          source.file_id,source.link_count,source.is_hidden,source.is_package,
+          source.safety_status,source.rule_id,source.reason,source.confidence,
+          source.source_application,source.is_protected_rule,NULL,source.is_deleted
+        FROM items AS source
+        LEFT JOIN items AS existing ON existing.scan_id=? AND existing.path=source.path
+        LEFT JOIN items AS overlay_parent ON overlay_parent.scan_id=source.scan_id
+          AND overlay_parent.id=source.parent_id
+        LEFT JOIN items AS base_parent ON base_parent.scan_id=?
+          AND base_parent.path=overlay_parent.path
+        WHERE source.scan_id=? AND existing.id IS NULL
+        """,
+        [.integer(baseScanID), .integer(baseScanID), .integer(baseScanID),
+          .integer(overlayScanID)])
+
+      // Directory statistics use the stable destination ID resolved by path.
+      try executeBound(
+        """
+        INSERT INTO directory_stats(
+          scan_id,item_id,item_count,file_count,directory_count,maximum_depth,contains_hard_links
+        )
+        SELECT ?,target.id,stats.item_count,stats.file_count,stats.directory_count,
+          stats.maximum_depth,stats.contains_hard_links
+        FROM directory_stats AS stats
+        JOIN items AS source ON source.scan_id=stats.scan_id AND source.id=stats.item_id
+        JOIN items AS target ON target.scan_id=? AND target.path=source.path
+        WHERE stats.scan_id=?
+        ON CONFLICT(scan_id,item_id) DO UPDATE SET
+          item_count=excluded.item_count,file_count=excluded.file_count,
+          directory_count=excluded.directory_count,maximum_depth=excluded.maximum_depth,
+          contains_hard_links=excluded.contains_hard_links
+        """, [.integer(baseScanID), .integer(baseScanID), .integer(overlayScanID)])
+
+      // Preserve errors in reused branches and replace errors below every
+      // directory that was actually enumerated during this update.
+      try executeBound(
+        """
+        DELETE FROM scan_errors AS error
+        WHERE error.scan_id=? AND EXISTS (
+          SELECT 1 FROM odt_enumerated_directories AS enumerated
+          WHERE error.path=enumerated.path
+             OR substr(error.path,1,length(enumerated.path)+1)=enumerated.path||'/'
+        )
+        """, [.integer(baseScanID)])
+      try executeBound(
+        """
+        INSERT INTO scan_errors(scan_id,path,error_code,message)
+        SELECT ?,path,error_code,message FROM scan_errors WHERE scan_id=?
+        """, [.integer(baseScanID), .integer(overlayScanID)])
+
+      try executeBound(
+        "DELETE FROM duplicate_groups WHERE scan_id=?", [.integer(baseScanID)])
+      try executeBound(
+        "UPDATE items SET duplicate_group_id=NULL WHERE scan_id=? AND duplicate_group_id IS NOT NULL",
+        [.integer(baseScanID)])
+      try reconcileHardLinkAccounting(scanID: baseScanID)
+
+      let root = try fetchItem(scanID: baseScanID, itemID: rootItemID)
+      let finished = Date()
+      let visibleItemCount = try scalarInt(
+        "SELECT COUNT(*) FROM items WHERE scan_id=? AND is_deleted=0",
+        [.integer(baseScanID)])
+      let inaccessible = try scalarInt(
+        "SELECT COUNT(*) FROM scan_errors WHERE scan_id=?", [.integer(baseScanID)])
+      try executeBound(
+        """
+        UPDATE scans SET
+          started_at=(SELECT started_at FROM scans WHERE id=?),finished_at=?,state='completed',
+          intensity=(SELECT intensity FROM scans WHERE id=?),scan_mode='incremental',
+          item_count=?,logical_bytes=?,allocated_bytes=?,inaccessible_count=?,
+          reused_item_count=?,journal_complete=?
+        WHERE id=?
+        """,
+        [.integer(overlayScanID), .text(Self.dateString(finished)), .integer(overlayScanID),
+          .integer(visibleItemCount),
+          .unsigned(root?.logicalBytes ?? result.progress.logicalBytes),
+          .unsigned(root?.allocatedBytes ?? result.progress.allocatedBytes),
+          .integer(inaccessible), .integer(result.reusedItemCount),
+          .integer(result.journalComplete ? 1 : 0), .integer(baseScanID)])
+
+      // Publishing the base snapshot must not wait for a cascade through every
+      // temporary item and index entry. Idle maintenance reclaims this hidden
+      // overlay after the updated snapshot is already visible.
+      try executeBound(
+        "UPDATE scans SET finished_at=?,state='cancelled',item_count=-1 WHERE id=?",
+        [.text(Self.dateString(finished)), .integer(overlayScanID)])
+      try database.execute("DROP TABLE odt_removed_item_ids")
+      try database.execute("DROP TABLE odt_enumerated_directories")
+      try database.execute("DROP TABLE odt_reused_paths")
+      try database.execute("COMMIT")
+      activeStreamingScanID = nil
+      guard let scan = try fetchScan(baseScanID) else { throw StoreError.missingScan(baseScanID) }
+      return scan
+    } catch {
+      try? database.execute("ROLLBACK")
+      activeStreamingScanID = nil
+      throw error
+    }
+  }
+
+  /// Prunes old successful snapshots on a separate SQLite connection. Large
+  /// cascade deletes update every query index and must not keep a completed
+  /// scan in the UI's Finalizing state. WAL lets normal result reads continue
+  /// while this background writer removes the old snapshot transactionally.
+  public nonisolated func pruneCompletedHistoryInBackground(
+    rootPath: String,
+    keeping count: Int = 2
+  ) async throws {
+    let databaseURL = self.databaseURL
+    try await Task.detached(priority: .background) {
+      let connection = try SQLiteConnection(url: databaseURL)
+      try connection.execute("PRAGMA foreign_keys=ON")
+      try connection.execute("PRAGMA busy_timeout=30000")
+      try connection.execute("PRAGMA cache_size=-131072")
+      try connection.execute("PRAGMA mmap_size=268435456")
+      try connection.execute("BEGIN IMMEDIATE")
+      do {
+        // A new process cannot resume a transaction owned by a previous app
+        // process. Remove those abandoned snapshots, plus obsolete partial
+        // snapshots that already have a newer successful replacement.
+        try connection.execute("DELETE FROM scans WHERE state='running'")
+        try connection.execute(
+          "DELETE FROM scans WHERE state='cancelled' AND item_count=-1")
+        try connection.execute(
+          """
+          DELETE FROM scans AS candidate
+          WHERE candidate.state IN ('cancelled','failed') AND EXISTS (
+            SELECT 1 FROM scans AS newer
+            WHERE newer.root_path=candidate.root_path
+              AND newer.state='completed' AND newer.id>candidate.id
+          )
+          """)
+        let sql = """
+          DELETE FROM scans
+          WHERE root_path=? AND state='completed' AND id NOT IN (
+            SELECT id FROM scans WHERE root_path=? AND state='completed' ORDER BY id DESC LIMIT ?
+          )
+          """
+        let statement = try connection.prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        try connection.bind(
+          [.text(rootPath), .text(rootPath), .integer(Int64(max(1, count)))],
+          to: statement,
+          sql: sql
+        )
+        try connection.stepDone(statement, sql: sql)
+        try connection.execute(
+          "DELETE FROM cleanup_actions WHERE scan_id NOT IN (SELECT id FROM scans)")
+        // Incremental updates mark removed subtrees immediately so foreground
+        // queries stop seeing them without paying cascade/index deletion cost.
+        // Reclaim those rows only after the UI has been idle.
+        try connection.execute("DELETE FROM items WHERE is_deleted=1")
+        try connection.execute("COMMIT")
+        // Keep checkpoint I/O off the foreground scan connection. Once old
+        // snapshots are gone, collapse the WAL while the UI is already usable.
+        try connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+      } catch {
+        try? connection.execute("ROLLBACK")
+        throw error
+      }
+    }.value
   }
 
   public func failScan(_ scanID: Int64, message: String) throws {
@@ -314,14 +688,11 @@ public actor ScanStore {
       to: statement, sql: sql)
     try database.stepDone(statement, sql: sql)
     try insert(errors: [ScanErrorRecord(scanID: scanID, path: "", code: EIO, message: message)])
-    try? rebuildDeferredIndexes()
+    try? ensureQueryIndexes()
   }
 
-  private func rebuildDeferredIndexes() throws {
+  private func ensureQueryIndexes() throws {
     try database.execute("CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path)")
-    try database.execute("CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status)")
-    try database.execute(
-      "CREATE INDEX IF NOT EXISTS items_duplicate_candidates ON items(scan_id,logical_bytes) WHERE kind='file'")
   }
 
   public func fetchScan(_ id: Int64) throws -> ScanRecord? {
@@ -329,7 +700,9 @@ public actor ScanStore {
   }
 
   public func recentScans(limit: Int = 30) throws -> [ScanRecord] {
-    try queryScans(whereClause: "ORDER BY started_at DESC", values: [], limit: limit)
+    try queryScans(
+      whereClause: "WHERE NOT (state='cancelled' AND item_count=-1) ORDER BY started_at DESC",
+      values: [], limit: limit)
   }
 
   public func deleteScan(_ scanID: Int64) throws {
@@ -340,6 +713,166 @@ public actor ScanStore {
   public func fetchItem(scanID: Int64, itemID: Int64) throws -> ScannedItem? {
     let sql = Self.itemSelect + " WHERE scan_id=? AND id=? LIMIT 1"
     return try queryItems(sql: sql, values: [.integer(scanID), .integer(itemID)]).first
+  }
+
+  public func latestCompletedScan(rootPath: String) throws -> ScanRecord? {
+    try queryScans(
+      whereClause: "WHERE root_path=? AND state='completed' ORDER BY id DESC",
+      values: [.text(rootPath)], limit: 1
+    ).first
+  }
+
+  public func maximumItemID(scanID: Int64) throws -> Int64 {
+    try scalarInt("SELECT COALESCE(MAX(id),1) FROM items WHERE scan_id=?", [.integer(scanID)])
+  }
+
+  public func makeReuseCatalog(scanID: Int64) throws -> SubtreeReuseCatalog {
+    let errorSQL = "SELECT path FROM scan_errors WHERE scan_id=?"
+    let errorStatement = try database.prepare(errorSQL)
+    defer { sqlite3_finalize(errorStatement) }
+    try database.bind([.integer(scanID)], to: errorStatement, sql: errorSQL)
+    var previouslyUnreadablePaths = Set<String>()
+    while sqlite3_step(errorStatement) == SQLITE_ROW {
+      if let path = Self.text(errorStatement, 0) { previouslyUnreadablePaths.insert(path) }
+    }
+    let sql = """
+      SELECT item.id,item.path,item.kind,item.modified_at,item.device_id,item.file_id,
+        item.logical_bytes,item.allocated_bytes,item.safety_status,item.rule_id,item.reason,
+        item.confidence,item.source_application,item.is_protected_rule,
+        stats.item_count,stats.file_count,stats.directory_count,stats.maximum_depth,
+        stats.contains_hard_links
+      FROM directory_stats AS stats
+      JOIN items AS item ON item.scan_id=stats.scan_id AND item.id=stats.item_id
+      WHERE stats.scan_id=? AND item.is_deleted=0
+      """
+    let statement = try database.prepare(sql)
+    defer { sqlite3_finalize(statement) }
+    try database.bind([.integer(scanID)], to: statement, sql: sql)
+    var entries: [String: SubtreeReuseCatalog.Entry] = [:]
+    entries.reserveCapacity(Int(try scalarInt(
+      "SELECT COUNT(*) FROM directory_stats WHERE scan_id=?", [.integer(scanID)])))
+    while sqlite3_step(statement) == SQLITE_ROW {
+      guard let path = Self.text(statement, 1),
+        let kind = ItemKind(rawValue: Self.text(statement, 2) ?? ""),
+        let status = SafetyStatus(rawValue: Self.text(statement, 8) ?? ""),
+        let confidence = RuleConfidence(rawValue: Self.text(statement, 11) ?? "")
+      else { continue }
+      entries[path] = SubtreeReuseCatalog.Entry(
+        itemID: sqlite3_column_int64(statement, 0), kind: kind,
+        modifiedAt: Self.date(Self.text(statement, 3)),
+        deviceID: UInt64(bitPattern: sqlite3_column_int64(statement, 4)),
+        fileID: UInt64(bitPattern: sqlite3_column_int64(statement, 5)),
+        logicalBytes: UInt64(max(0, sqlite3_column_int64(statement, 6))),
+        allocatedBytes: UInt64(max(0, sqlite3_column_int64(statement, 7))),
+        itemCount: sqlite3_column_int64(statement, 14),
+        fileCount: sqlite3_column_int64(statement, 15),
+        directoryCount: sqlite3_column_int64(statement, 16),
+        maximumDepth: Int(sqlite3_column_int64(statement, 17)),
+        containsHardLinks: sqlite3_column_int(statement, 18) != 0,
+        classification: Classification(
+          status: status, ruleID: Self.text(statement, 9),
+          reason: Self.text(statement, 10) ?? "", confidence: confidence,
+          sourceApplication: Self.text(statement, 12),
+          isProtectedRule: sqlite3_column_int(statement, 13) != 0))
+    }
+    return SubtreeReuseCatalog(
+      entries: entries, previouslyUnreadablePaths: previouslyUnreadablePaths)
+  }
+
+  /// Reuses an unchanged directory from a previous snapshot. Materialized
+  /// snapshots copy descendants; fast in-place updates only record the reuse
+  /// boundary and merge the small changed overlay into the base snapshot.
+  public func reuseSubtree(
+    previousScanID: Int64,
+    newScanID: Int64,
+    candidate: ScannedItem,
+    changedPaths: [String],
+    materialize: Bool = true
+  ) throws -> ReusedSubtree? {
+    guard candidate.kind.canHaveChildren,
+      !sortedPathsContainDescendant(changedPaths, root: candidate.path)
+    else { return nil }
+    guard
+      let previous = try queryItems(
+        sql: Self.itemSelect + " WHERE scan_id=? AND path=? LIMIT 1",
+        values: [.integer(previousScanID), .text(candidate.path)]
+      ).first,
+      previous.kind == candidate.kind,
+      previous.deviceID == candidate.deviceID,
+      previous.fileID == candidate.fileID,
+      previous.modifiedAt == candidate.modifiedAt
+    else { return nil }
+    let escaped = candidate.path.replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
+    let prefix = escaped + "/%"
+    let cachedStats = try queryCachedReuseStats(
+      scanID: previousScanID, itemID: previous.id)
+    let stats: ReuseStats
+    if let cachedStats {
+      stats = ReuseStats(
+        itemCount: cachedStats.itemCount,
+        fileCount: cachedStats.fileCount,
+        directoryCount: cachedStats.directoryCount,
+        logicalBytes: previous.logicalBytes,
+        allocatedBytes: previous.allocatedBytes,
+        maximumDepth: cachedStats.maximumDepth,
+        containsHardLinks: cachedStats.containsHardLinks)
+    } else {
+      let hasHardLinks =
+        try scalarInt(
+          "SELECT COUNT(*) FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\' AND link_count>1",
+          [.integer(previousScanID), .text(prefix)]) > 0
+      guard !hasHardLinks else { return nil }
+      let statsSQL = """
+        SELECT COUNT(*),
+          SUM(CASE WHEN kind='file' THEN 1 ELSE 0 END),
+          SUM(CASE WHEN kind IN ('directory','package') THEN 1 ELSE 0 END),
+          COALESCE(SUM(CASE WHEN kind IN ('directory','package') THEN 0 ELSE own_logical_bytes END),0),
+          COALESCE(SUM(CASE WHEN kind IN ('directory','package') THEN 0 ELSE accounted_allocated_bytes END),0),
+          COALESCE(MAX(depth),?)
+        FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\'
+        """
+      stats = try queryReuseStats(
+        sql: statsSQL,
+        values: [.integer(Int64(candidate.depth)), .integer(previousScanID), .text(prefix)]
+      )
+      guard stats.itemCount > 0 else { return nil }
+    }
+    if materialize {
+      let sql = """
+        INSERT INTO items(
+          id,scan_id,parent_id,path,name,depth,kind,extension,
+          own_logical_bytes,own_allocated_bytes,accounted_allocated_bytes,logical_bytes,allocated_bytes,
+          created_at,modified_at,device_id,file_id,link_count,is_hidden,is_package,
+          safety_status,rule_id,reason,confidence,source_application,is_protected_rule,
+          duplicate_group_id,is_deleted
+        ) SELECT id,?,parent_id,path,name,depth,kind,extension,
+          own_logical_bytes,own_allocated_bytes,accounted_allocated_bytes,logical_bytes,allocated_bytes,
+          created_at,modified_at,device_id,file_id,link_count,is_hidden,is_package,
+          safety_status,rule_id,reason,confidence,source_application,is_protected_rule,
+          NULL,is_deleted
+        FROM items WHERE scan_id=? AND path LIKE ? ESCAPE '\\'
+        """
+      try executeBound(sql, [.integer(newScanID), .integer(previousScanID), .text(prefix)])
+      try executeBound(
+        """
+        INSERT INTO directory_stats(
+          scan_id,item_id,item_count,file_count,directory_count,maximum_depth,contains_hard_links
+        ) SELECT ?,stats.item_id,stats.item_count,stats.file_count,stats.directory_count,
+            stats.maximum_depth,stats.contains_hard_links
+          FROM directory_stats AS stats
+          JOIN items AS source ON source.scan_id=stats.scan_id AND source.id=stats.item_id
+          WHERE stats.scan_id=? AND source.path LIKE ? ESCAPE '\\'
+        """,
+        [.integer(newScanID), .integer(previousScanID), .text(prefix)])
+    }
+    return ReusedSubtree(
+      itemID: previous.id, itemCount: stats.itemCount, fileCount: stats.fileCount,
+      directoryCount: stats.directoryCount, logicalBytes: stats.logicalBytes,
+      allocatedBytes: stats.allocatedBytes, maximumDepth: stats.maximumDepth,
+      containsHardLinks: stats.containsHardLinks,
+      classification: previous.classification
+    )
   }
 
   public func fetchChildren(
@@ -459,6 +992,36 @@ public actor ScanStore {
         Self.itemSelect
         + " WHERE \(clauses.joined(separator: " AND ")) ORDER BY id ASC LIMIT ? OFFSET ?"
       return try queryItems(sql: sql, values: values)
+    }
+  }
+
+  /// Keyset-paginated export query. OFFSET becomes increasingly expensive for
+  /// multi-million-row snapshots because SQLite must walk every skipped row on
+  /// every page. IDs are monotonic within a snapshot, so exports can seek
+  /// directly to the next page for the common full/filter scopes.
+  public func fetchItemsPageAfterID(
+    scanID: Int64,
+    scope: ExportScope,
+    afterID: Int64,
+    limit: Int = 5_000
+  ) throws -> [ScannedItem] {
+    switch scope {
+    case .entireScan, .filtered:
+      var clauses = ["scan_id=?", "is_deleted=0", "id>?"]
+      var values: [SQLValue] = [.integer(scanID), .integer(afterID)]
+      if case .filtered(let filter) = scope {
+        append(filter: filter, clauses: &clauses, values: &values)
+      }
+      values.append(.integer(Int64(limit)))
+      let sql =
+        Self.itemSelect
+        + " WHERE \(clauses.joined(separator: " AND ")) ORDER BY id ASC LIMIT ?"
+      return try queryItems(sql: sql, values: values)
+    case .selection:
+      // Selection scopes need their path-prefix predicates and are normally
+      // much smaller; retain the existing implementation until their IDs are
+      // materialized into a temporary scope table.
+      return try fetchItemsPage(scanID: scanID, scope: scope, limit: limit, offset: 0)
     }
   }
 
@@ -821,13 +1384,152 @@ public actor ScanStore {
     }
   }
 
+  /// Applies the scanner's single-pass bottom-up aggregation. The previous SQL
+  /// implementation rescanned a multi-million-row table once per path depth;
+  /// deeply nested dependency trees made that final phase longer than the disk
+  /// traversal itself. Full scans now compute the same rollups while metadata is
+  /// already hot and update each directory exactly once.
+  private func applyDirectoryRollups(scanID: Int64, rollups: [DirectoryRollup]) throws {
+    guard !rollups.isEmpty else { return }
+    let sql = """
+      UPDATE items SET
+        logical_bytes=?, allocated_bytes=?, safety_status=?, rule_id=?, reason=?, confidence=?,
+        source_application=?, is_protected_rule=?
+      WHERE scan_id=? AND id=?
+      """
+    let statement = try database.prepare(sql)
+    let statsSQL = """
+      INSERT INTO directory_stats(
+        scan_id,item_id,item_count,file_count,directory_count,maximum_depth,contains_hard_links
+      ) VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(scan_id,item_id) DO UPDATE SET
+        item_count=excluded.item_count,
+        file_count=excluded.file_count,
+        directory_count=excluded.directory_count,
+        maximum_depth=excluded.maximum_depth,
+        contains_hard_links=excluded.contains_hard_links
+      """
+    let statsStatement = try database.prepare(statsSQL)
+    defer {
+      sqlite3_finalize(statement)
+      sqlite3_finalize(statsStatement)
+    }
+    let ownsTransaction = activeStreamingScanID == nil
+    if ownsTransaction { try database.execute("BEGIN IMMEDIATE") }
+    do {
+      for rollup in rollups {
+        let classification = rollup.classification
+        try database.bind(
+          [
+            .unsigned(rollup.logicalBytes), .unsigned(rollup.allocatedBytes),
+            .text(classification.status.rawValue),
+            classification.ruleID.map(SQLValue.text) ?? .null,
+            .text(classification.reason), .text(classification.confidence.rawValue),
+            classification.sourceApplication.map(SQLValue.text) ?? .null,
+            .integer(classification.isProtectedRule ? 1 : 0),
+            .integer(scanID), .integer(rollup.itemID),
+          ], to: statement, sql: sql)
+        try database.stepDone(statement, sql: sql)
+        try database.bind(
+          [
+            .integer(scanID), .integer(rollup.itemID), .integer(rollup.itemCount),
+            .integer(rollup.fileCount), .integer(rollup.directoryCount),
+            .integer(Int64(rollup.maximumDepth)),
+            .integer(rollup.containsHardLinks ? 1 : 0),
+          ], to: statsStatement, sql: statsSQL)
+        try database.stepDone(statsStatement, sql: statsSQL)
+      }
+      if ownsTransaction { try database.execute("COMMIT") }
+    } catch {
+      if ownsTransaction { try? database.execute("ROLLBACK") }
+      throw error
+    }
+  }
+
+  /// Reused subtrees retain their previous hard-link accounting while changed
+  /// branches are enumerated again. A link can cross that boundary, so the
+  /// scanner alone cannot know which path already owns the physical blocks.
+  /// Rank every hard-link identity once, keep one owner, then propagate only
+  /// the resulting deltas through its ancestors.
+  private func reconcileHardLinkAccounting(scanID: Int64) throws {
+    try database.execute("DROP TABLE IF EXISTS temp.odt_hardlink_adjustments")
+    try database.execute(
+      "CREATE TEMP TABLE odt_hardlink_adjustments(item_id INTEGER PRIMARY KEY, target_bytes INTEGER NOT NULL, delta INTEGER NOT NULL) WITHOUT ROWID")
+    try executeBound(
+      """
+      INSERT INTO odt_hardlink_adjustments(item_id,target_bytes,delta)
+      WITH ranked AS (
+        SELECT id,accounted_allocated_bytes,own_allocated_bytes,
+          ROW_NUMBER() OVER (
+            PARTITION BY device_id,file_id
+            ORDER BY CASE WHEN accounted_allocated_bytes>0 THEN 0 ELSE 1 END,id
+          ) AS owner_rank
+        FROM items
+        WHERE scan_id=? AND kind='file' AND link_count>1 AND is_deleted=0
+      )
+      SELECT id,
+        CASE WHEN owner_rank=1 THEN own_allocated_bytes ELSE 0 END,
+        CASE WHEN owner_rank=1 THEN own_allocated_bytes ELSE 0 END-accounted_allocated_bytes
+      FROM ranked
+      WHERE (CASE WHEN owner_rank=1 THEN own_allocated_bytes ELSE 0 END)<>accounted_allocated_bytes
+      """, [.integer(scanID)])
+
+    guard try scalarInt("SELECT COUNT(*) FROM odt_hardlink_adjustments", []) > 0 else {
+      try database.execute("DROP TABLE odt_hardlink_adjustments")
+      return
+    }
+
+    try database.execute("DROP TABLE IF EXISTS temp.odt_hardlink_ancestor_deltas")
+    try database.execute(
+      "CREATE TEMP TABLE odt_hardlink_ancestor_deltas(item_id INTEGER PRIMARY KEY, delta INTEGER NOT NULL) WITHOUT ROWID")
+    try executeBound(
+      """
+      INSERT INTO odt_hardlink_ancestor_deltas(item_id,delta)
+      WITH RECURSIVE lineage(item_id,parent_id,delta) AS (
+        SELECT parent.id,parent.parent_id,adjustment.delta
+        FROM odt_hardlink_adjustments AS adjustment
+        JOIN items AS child ON child.scan_id=? AND child.id=adjustment.item_id
+        JOIN items AS parent ON parent.scan_id=child.scan_id AND parent.id=child.parent_id
+        UNION ALL
+        SELECT parent.id,parent.parent_id,lineage.delta
+        FROM lineage
+        JOIN items AS parent ON parent.scan_id=? AND parent.id=lineage.parent_id
+      )
+      SELECT item_id,SUM(delta) FROM lineage GROUP BY item_id
+      """, [.integer(scanID), .integer(scanID)])
+    try executeBound(
+      """
+      UPDATE items SET
+        accounted_allocated_bytes=(
+          SELECT target_bytes FROM odt_hardlink_adjustments WHERE item_id=items.id
+        ),
+        allocated_bytes=allocated_bytes+(
+          SELECT delta FROM odt_hardlink_adjustments WHERE item_id=items.id
+        )
+      WHERE scan_id=? AND id IN (SELECT item_id FROM odt_hardlink_adjustments)
+      """, [.integer(scanID)])
+    try executeBound(
+      """
+      UPDATE items SET allocated_bytes=allocated_bytes+(
+        SELECT delta FROM odt_hardlink_ancestor_deltas WHERE item_id=items.id
+      )
+      WHERE scan_id=? AND id IN (SELECT item_id FROM odt_hardlink_ancestor_deltas)
+      """, [.integer(scanID)])
+    try database.execute("DROP TABLE odt_hardlink_ancestor_deltas")
+    try database.execute("DROP TABLE odt_hardlink_adjustments")
+  }
+
   private static func migrate(_ database: SQLiteConnection) throws {
     try database.execute(
       """
+      PRAGMA page_size=32768;
       PRAGMA journal_mode=WAL;
+      PRAGMA wal_autocheckpoint=0;
       PRAGMA synchronous=NORMAL;
       PRAGMA foreign_keys=ON;
       PRAGMA temp_store=MEMORY;
+      PRAGMA cache_size=-262144;
+      PRAGMA mmap_size=536870912;
       CREATE TABLE IF NOT EXISTS scans(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         root_path TEXT NOT NULL,
@@ -837,10 +1539,13 @@ public actor ScanStore {
         finished_at TEXT,
         state TEXT NOT NULL,
         intensity TEXT NOT NULL,
+        scan_mode TEXT NOT NULL DEFAULT 'full',
         item_count INTEGER NOT NULL DEFAULT 0,
         logical_bytes INTEGER NOT NULL DEFAULT 0,
         allocated_bytes INTEGER NOT NULL DEFAULT 0,
-        inaccessible_count INTEGER NOT NULL DEFAULT 0
+        inaccessible_count INTEGER NOT NULL DEFAULT 0,
+        reused_item_count INTEGER NOT NULL DEFAULT 0,
+        journal_complete INTEGER NOT NULL DEFAULT 1
       );
       CREATE TABLE IF NOT EXISTS items(
         id INTEGER NOT NULL,
@@ -872,13 +1577,26 @@ public actor ScanStore {
         duplicate_group_id INTEGER,
         is_deleted INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(scan_id,id)
-      );
-      CREATE INDEX IF NOT EXISTS items_parent ON items(scan_id,parent_id);
+      ) WITHOUT ROWID;
+      DROP INDEX IF EXISTS items_parent;
+      DROP INDEX IF EXISTS items_status;
+      DROP INDEX IF EXISTS items_duplicate_candidates;
       CREATE INDEX IF NOT EXISTS items_parent_size ON items(scan_id,parent_id,allocated_bytes DESC);
       CREATE INDEX IF NOT EXISTS items_size ON items(scan_id,allocated_bytes DESC);
       CREATE INDEX IF NOT EXISTS items_path ON items(scan_id,path);
-      CREATE INDEX IF NOT EXISTS items_status ON items(scan_id,safety_status);
-      CREATE INDEX IF NOT EXISTS items_duplicate_candidates ON items(scan_id,logical_bytes) WHERE kind='file';
+      CREATE INDEX IF NOT EXISTS items_hardlink_identity
+        ON items(scan_id,device_id,file_id) WHERE kind='file' AND link_count>1;
+      CREATE TABLE IF NOT EXISTS directory_stats(
+        scan_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        item_count INTEGER NOT NULL,
+        file_count INTEGER NOT NULL,
+        directory_count INTEGER NOT NULL,
+        maximum_depth INTEGER NOT NULL,
+        contains_hard_links INTEGER NOT NULL,
+        PRIMARY KEY(scan_id,item_id),
+        FOREIGN KEY(scan_id,item_id) REFERENCES items(scan_id,id) ON DELETE CASCADE
+      ) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS scan_errors(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
@@ -948,6 +1666,14 @@ public actor ScanStore {
         PRAGMA foreign_keys=ON;
         """)
     }
+    if version < 3 {
+      try? database.execute("ALTER TABLE scans ADD COLUMN scan_mode TEXT NOT NULL DEFAULT 'full'")
+      try? database.execute(
+        "ALTER TABLE scans ADD COLUMN reused_item_count INTEGER NOT NULL DEFAULT 0")
+      try? database.execute(
+        "ALTER TABLE scans ADD COLUMN journal_complete INTEGER NOT NULL DEFAULT 1")
+      try database.execute("PRAGMA user_version=3")
+    }
   }
 
   private func append(filter: ItemFilter, clauses: inout [String], values: inout [SQLValue]) {
@@ -993,7 +1719,7 @@ public actor ScanStore {
     -> [ScanRecord]
   {
     let sql =
-      "SELECT id,root_path,volume_name,volume_uuid,started_at,finished_at,state,intensity,item_count,logical_bytes,allocated_bytes,inaccessible_count FROM scans \(whereClause) LIMIT ?"
+      "SELECT id,root_path,volume_name,volume_uuid,started_at,finished_at,state,intensity,scan_mode,item_count,logical_bytes,allocated_bytes,inaccessible_count,reused_item_count,journal_complete FROM scans \(whereClause) LIMIT ?"
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
     try database.bind(values + [.integer(Int64(limit))], to: statement, sql: sql)
@@ -1009,10 +1735,13 @@ public actor ScanStore {
           volumeName: Self.text(statement, 2) ?? "", volumeUUID: Self.text(statement, 3),
           startedAt: started, finishedAt: Self.date(Self.text(statement, 5)), state: state,
           intensity: intensity,
-          itemCount: sqlite3_column_int64(statement, 8),
-          logicalBytes: UInt64(max(0, sqlite3_column_int64(statement, 9))),
-          allocatedBytes: UInt64(max(0, sqlite3_column_int64(statement, 10))),
-          inaccessibleCount: sqlite3_column_int64(statement, 11)
+          mode: ScanMode(rawValue: Self.text(statement, 8) ?? "") ?? .full,
+          reusedItemCount: sqlite3_column_int64(statement, 13),
+          journalComplete: sqlite3_column_int(statement, 14) != 0,
+          itemCount: sqlite3_column_int64(statement, 9),
+          logicalBytes: UInt64(max(0, sqlite3_column_int64(statement, 10))),
+          allocatedBytes: UInt64(max(0, sqlite3_column_int64(statement, 11))),
+          inaccessibleCount: sqlite3_column_int64(statement, 12)
         ))
     }
     return scans
@@ -1054,23 +1783,51 @@ public actor ScanStore {
     try database.stepDone(statement, sql: sql)
   }
 
+  private func queryReuseStats(sql: String, values: [SQLValue]) throws -> ReuseStats {
+    let statement = try database.prepare(sql)
+    defer { sqlite3_finalize(statement) }
+    try database.bind(values, to: statement, sql: sql)
+    guard sqlite3_step(statement) == SQLITE_ROW else {
+      return ReuseStats(
+        itemCount: 0, fileCount: 0, directoryCount: 0, logicalBytes: 0, allocatedBytes: 0,
+        maximumDepth: 0, containsHardLinks: false)
+    }
+    return ReuseStats(
+      itemCount: sqlite3_column_int64(statement, 0),
+      fileCount: sqlite3_column_int64(statement, 1),
+      directoryCount: sqlite3_column_int64(statement, 2),
+      logicalBytes: UInt64(max(0, sqlite3_column_int64(statement, 3))),
+      allocatedBytes: UInt64(max(0, sqlite3_column_int64(statement, 4))),
+      maximumDepth: Int(sqlite3_column_int64(statement, 5)),
+      containsHardLinks: false
+    )
+  }
+
+  private func queryCachedReuseStats(scanID: Int64, itemID: Int64) throws -> ReuseStats? {
+    let sql = """
+      SELECT item_count,file_count,directory_count,maximum_depth,contains_hard_links
+      FROM directory_stats WHERE scan_id=? AND item_id=?
+      """
+    let statement = try database.prepare(sql)
+    defer { sqlite3_finalize(statement) }
+    try database.bind([.integer(scanID), .integer(itemID)], to: statement, sql: sql)
+    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+    return ReuseStats(
+      itemCount: sqlite3_column_int64(statement, 0),
+      fileCount: sqlite3_column_int64(statement, 1),
+      directoryCount: sqlite3_column_int64(statement, 2),
+      logicalBytes: 0,
+      allocatedBytes: 0,
+      maximumDepth: Int(sqlite3_column_int64(statement, 3)),
+      containsHardLinks: sqlite3_column_int(statement, 4) != 0)
+  }
+
   private func scalarInt(_ sql: String, _ values: [SQLValue]) throws -> Int64 {
     let statement = try database.prepare(sql)
     defer { sqlite3_finalize(statement) }
     try database.bind(values, to: statement, sql: sql)
     guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
     return sqlite3_column_int64(statement, 0)
-  }
-
-  private func pruneCompletedHistory(rootPath: String, keeping count: Int) throws {
-    try executeBound(
-      """
-      DELETE FROM scans
-      WHERE root_path=? AND state='completed' AND id NOT IN (
-        SELECT id FROM scans WHERE root_path=? AND state='completed' ORDER BY id DESC LIMIT ?
-      )
-      """, [.text(rootPath), .text(rootPath), .integer(Int64(count))])
-    try database.execute("DELETE FROM cleanup_actions WHERE scan_id NOT IN (SELECT id FROM scans)")
   }
 
   private static let itemSelect = """
@@ -1128,6 +1885,28 @@ public actor ScanStore {
     if let seconds = TimeInterval(string) { return Date(timeIntervalSince1970: seconds) }
     return iso8601Formatter.value.date(from: string)
   }
+}
+
+private func pathIsEqualOrDescendant(_ path: String, of root: String) -> Bool {
+  path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+}
+
+/// `paths` must use Swift's ascending String order. Returns whether the root
+/// itself or any of its descendants occurs in the collection.
+private func sortedPathsContainDescendant(_ paths: [String], root: String) -> Bool {
+  guard !paths.isEmpty else { return false }
+  var lower = 0
+  var upper = paths.count
+  while lower < upper {
+    let middle = lower + (upper - lower) / 2
+    if paths[middle] < root {
+      lower = middle + 1
+    } else {
+      upper = middle
+    }
+  }
+  guard lower < paths.count else { return false }
+  return pathIsEqualOrDescendant(paths[lower], of: root)
 }
 
 extension Int64 {

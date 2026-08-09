@@ -6,8 +6,8 @@ public enum ScanIntensity: String, Codable, CaseIterable, Sendable {
 
   public var parallelism: Int {
     switch self {
-    case .balanced: max(2, min(6, ProcessInfo.processInfo.activeProcessorCount / 2))
-    case .turbo: max(4, min(16, ProcessInfo.processInfo.activeProcessorCount))
+    case .balanced: max(8, min(16, ProcessInfo.processInfo.activeProcessorCount * 2))
+    case .turbo: 64
     }
   }
 }
@@ -17,6 +17,11 @@ public enum ScanState: String, Codable, Sendable {
   case completed
   case cancelled
   case failed
+}
+
+public enum ScanMode: String, Codable, CaseIterable, Sendable {
+  case full
+  case incremental
 }
 
 public enum ItemKind: String, Codable, CaseIterable, Sendable {
@@ -236,6 +241,9 @@ public struct ScanRecord: Identifiable, Codable, Sendable, Equatable {
   public var finishedAt: Date?
   public var state: ScanState
   public let intensity: ScanIntensity
+  public let mode: ScanMode
+  public var reusedItemCount: Int64
+  public var journalComplete: Bool
   public var itemCount: Int64
   public var logicalBytes: UInt64
   public var allocatedBytes: UInt64
@@ -285,6 +293,66 @@ public struct ScannerResult: Sendable, Equatable {
   public let bulkDirectoryCount: Int
   public let fallbackDirectoryCount: Int
   public let maximumDepth: Int
+  public let reusedItemCount: Int64
+  public let reusedPaths: [String]
+  public let journalComplete: Bool
+  public let directoryRollups: [DirectoryRollup]
+
+  public init(
+    progress: ScanProgress,
+    cancelled: Bool,
+    bulkDirectoryCount: Int,
+    fallbackDirectoryCount: Int,
+    maximumDepth: Int,
+    reusedItemCount: Int64 = 0,
+    reusedPaths: [String] = [],
+    journalComplete: Bool = true,
+    directoryRollups: [DirectoryRollup] = []
+  ) {
+    self.progress = progress
+    self.cancelled = cancelled
+    self.bulkDirectoryCount = bulkDirectoryCount
+    self.fallbackDirectoryCount = fallbackDirectoryCount
+    self.maximumDepth = maximumDepth
+    self.reusedItemCount = reusedItemCount
+    self.reusedPaths = reusedPaths
+    self.journalComplete = journalComplete
+    self.directoryRollups = directoryRollups
+  }
+}
+
+public struct DirectoryRollup: Sendable, Equatable {
+  public let itemID: Int64
+  public let logicalBytes: UInt64
+  public let allocatedBytes: UInt64
+  public let itemCount: Int64
+  public let fileCount: Int64
+  public let directoryCount: Int64
+  public let maximumDepth: Int
+  public let containsHardLinks: Bool
+  public let classification: Classification
+
+  public init(
+    itemID: Int64,
+    logicalBytes: UInt64,
+    allocatedBytes: UInt64,
+    itemCount: Int64 = 0,
+    fileCount: Int64 = 0,
+    directoryCount: Int64 = 0,
+    maximumDepth: Int = 0,
+    containsHardLinks: Bool = false,
+    classification: Classification
+  ) {
+    self.itemID = itemID
+    self.logicalBytes = logicalBytes
+    self.allocatedBytes = allocatedBytes
+    self.itemCount = itemCount
+    self.fileCount = fileCount
+    self.directoryCount = directoryCount
+    self.maximumDepth = maximumDepth
+    self.containsHardLinks = containsHardLinks
+    self.classification = classification
+  }
 }
 
 public struct DuplicateGroup: Identifiable, Codable, Sendable, Equatable {

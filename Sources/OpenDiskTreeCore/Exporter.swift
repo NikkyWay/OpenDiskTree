@@ -29,6 +29,11 @@ public struct ExportOptions: Sendable {
 public struct ExportProgress: Sendable, Equatable {
   public let exportedItems: Int
   public let bytesWritten: UInt64
+
+  public init(exportedItems: Int, bytesWritten: UInt64) {
+    self.exportedItems = exportedItems
+    self.bytesWritten = bytesWritten
+  }
 }
 
 private struct ExportManifest: Encodable {
@@ -68,7 +73,7 @@ private struct ExportItem: Encodable {
     id = item.id
     parentID = item.parentID
     self.path = path
-    name = URL(fileURLWithPath: path).lastPathComponent
+    name = pathLastComponent(path)
     depth = item.depth
     kind = item.kind
     fileExtension = item.fileExtension
@@ -97,6 +102,9 @@ private struct ExportScan: Encodable {
   let finishedAt: Date?
   let state: ScanState
   let intensity: ScanIntensity
+  let mode: ScanMode
+  let reusedItemCount: Int64
+  let journalComplete: Bool
   let itemCount: Int64
   let logicalBytes: UInt64
   let allocatedBytes: UInt64
@@ -111,6 +119,9 @@ private struct ExportScan: Encodable {
     finishedAt = scan.finishedAt
     state = scan.state
     intensity = scan.intensity
+    mode = scan.mode
+    reusedItemCount = scan.reusedItemCount
+    journalComplete = scan.journalComplete
     itemCount = scan.itemCount
     logicalBytes = scan.logicalBytes
     allocatedBytes = scan.allocatedBytes
@@ -143,6 +154,11 @@ private struct AIReport: Encodable {
 }
 
 public actor ScanExporter {
+  private final class ISO8601FormatterBox: @unchecked Sendable {
+    let value = ISO8601DateFormatter()
+  }
+
+  private static let iso8601Formatter = ISO8601FormatterBox()
   private let store: ScanStore
 
   public init(store: ScanStore) { self.store = store }
@@ -230,19 +246,29 @@ public actor ScanExporter {
     try write(encoder.encode(safeDuplicates))
     try write(Data(",\"items\":[".utf8))
     var offset = 0
+    var lastID: Int64 = 0
+    let useKeyset = !isSelectionScope(options.scope)
     var first = true
     while true {
-      let page = try await store.fetchItemsPage(
-        scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
+      try Task.checkCancellation()
+      let page = useKeyset
+        ? try await store.fetchItemsPageAfterID(
+          scanID: scanID, scope: options.scope, afterID: lastID, limit: 5_000)
+        : try await store.fetchItemsPage(
+          scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
       if page.isEmpty { break }
+      var pageData = Data()
+      pageData.reserveCapacity(page.count * 320)
       for item in page {
-        if !first { try write(Data(",".utf8)) }
+        if !first { pageData.append(contentsOf: Data(",".utf8)) }
         first = false
         let exported = ExportItem(
           item, path: redactor.redact(item.path), includeHashDetails: options.privacy != .strict)
-        try write(encoder.encode(exported))
+        try pageData.append(encoder.encode(exported))
       }
+      try write(pageData)
       offset += page.count
+      if useKeyset { lastID = page.last?.id ?? lastID }
       await onProgress(ExportProgress(exportedItems: offset, bytesWritten: written))
     }
     try write(Data("]}".utf8))
@@ -262,10 +288,16 @@ public actor ScanExporter {
     try handle.write(contentsOf: Data(header.utf8))
     var written = UInt64(header.utf8.count)
     var offset = 0
+    var lastID: Int64 = 0
+    let useKeyset = !isSelectionScope(options.scope)
     var redactor = PathRedactor(mode: options.privacy)
     while true {
-      let page = try await store.fetchItemsPage(
-        scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
+      try Task.checkCancellation()
+      let page = useKeyset
+        ? try await store.fetchItemsPageAfterID(
+          scanID: scanID, scope: options.scope, afterID: lastID, limit: 5_000)
+        : try await store.fetchItemsPage(
+          scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
       if page.isEmpty { break }
       var text = ""
       text.reserveCapacity(page.count * 240)
@@ -277,7 +309,7 @@ public actor ScanExporter {
         values.append(String(item.id))
         values.append(item.parentID.map(String.init) ?? "")
         values.append(path)
-        values.append(URL(fileURLWithPath: path).lastPathComponent)
+        values.append(pathLastComponent(path))
         values.append(String(item.depth))
         values.append(item.kind.rawValue)
         values.append(item.fileExtension ?? "")
@@ -300,6 +332,7 @@ public actor ScanExporter {
       try handle.write(contentsOf: data)
       written += UInt64(data.count)
       offset += page.count
+      if useKeyset { lastID = page.last?.id ?? lastID }
       await onProgress(ExportProgress(exportedItems: offset, bytesWritten: written))
     }
   }
@@ -316,50 +349,80 @@ public actor ScanExporter {
     }
     defer { sqlite3_close(handle) }
     let schema = """
+      PRAGMA foreign_keys=ON;
       PRAGMA journal_mode=DELETE;
       CREATE TABLE manifest(schema_version INTEGER, generated_at TEXT, privacy_mode TEXT, scope TEXT, contains_file_contents INTEGER);
-      CREATE TABLE scan(json TEXT NOT NULL);
-      CREATE TABLE items(id INTEGER PRIMARY KEY,parent_id INTEGER,path TEXT,name TEXT,depth INTEGER,kind TEXT,extension TEXT,logical_bytes INTEGER,allocated_bytes INTEGER,created_at TEXT,modified_at TEXT,link_count INTEGER,is_hidden INTEGER,is_package INTEGER,safety_status TEXT,rule_id TEXT,reason TEXT,confidence TEXT,source_application TEXT,duplicate_group_id INTEGER);
-      CREATE INDEX items_parent ON items(parent_id);
-      CREATE INDEX items_size ON items(allocated_bytes DESC);
-      CREATE INDEX items_status ON items(safety_status);
-      CREATE TABLE scan_errors(path TEXT,error_code INTEGER,message TEXT);
-      CREATE TABLE duplicate_groups(id INTEGER PRIMARY KEY,logical_bytes INTEGER,sha256 TEXT,reclaimable_bytes INTEGER);
-      CREATE TABLE duplicate_members(group_id INTEGER,item_id INTEGER,PRIMARY KEY(group_id,item_id));
+      CREATE TABLE scans(id INTEGER PRIMARY KEY,root_path TEXT,volume_name TEXT,volume_uuid TEXT,started_at TEXT,finished_at TEXT,state TEXT,intensity TEXT,scan_mode TEXT,reused_item_count INTEGER,journal_complete INTEGER,item_count INTEGER,logical_bytes INTEGER,allocated_bytes INTEGER,inaccessible_count INTEGER);
+      CREATE TABLE volumes(id INTEGER PRIMARY KEY AUTOINCREMENT,scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,name TEXT NOT NULL,uuid TEXT,is_local INTEGER NOT NULL DEFAULT 1);
+      CREATE TABLE items(scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,id INTEGER NOT NULL,parent_id INTEGER,path TEXT,name TEXT,depth INTEGER,kind TEXT,extension TEXT,logical_bytes INTEGER,allocated_bytes INTEGER,created_at TEXT,modified_at TEXT,link_count INTEGER,is_hidden INTEGER,is_package INTEGER,safety_status TEXT,rule_id TEXT,reason TEXT,confidence TEXT,source_application TEXT,duplicate_group_id INTEGER,is_deleted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(scan_id,id));
+      CREATE INDEX items_parent ON items(scan_id,parent_id);
+      CREATE INDEX items_size ON items(scan_id,allocated_bytes DESC);
+      CREATE INDEX items_status ON items(scan_id,safety_status);
+      CREATE TABLE scan_errors(id INTEGER PRIMARY KEY AUTOINCREMENT,scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,path TEXT,error_code INTEGER,message TEXT);
+      CREATE TABLE rules(id TEXT PRIMARY KEY,json TEXT NOT NULL);
+      CREATE TABLE duplicate_groups(scan_id INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,id INTEGER NOT NULL,logical_bytes INTEGER,sha256 TEXT,reclaimable_bytes INTEGER,PRIMARY KEY(scan_id,id));
+      CREATE TABLE duplicate_members(scan_id INTEGER NOT NULL,group_id INTEGER NOT NULL,item_id INTEGER NOT NULL,PRIMARY KEY(scan_id,group_id,item_id),FOREIGN KEY(scan_id,group_id) REFERENCES duplicate_groups(scan_id,id) ON DELETE CASCADE,FOREIGN KEY(scan_id,item_id) REFERENCES items(scan_id,id) ON DELETE CASCADE);
       """
     guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK else {
       throw StoreError.open(String(cString: sqlite3_errmsg(handle)))
     }
     var redactor = PathRedactor(mode: options.privacy)
-    let scan =
-      try await store.fetchScan(scanID).map {
-        let exported = ExportScan(
-          $0, rootPath: redactor.redact($0.rootPath), privacy: options.privacy)
-        return String(decoding: try Self.encoder().encode(exported), as: UTF8.self)
-      } ?? "{}"
+    guard let sourceScan = try await store.fetchScan(scanID) else {
+      throw StoreError.missingScan(scanID)
+    }
+    let exportedScan = ExportScan(
+      sourceScan, rootPath: redactor.redact(sourceScan.rootPath), privacy: options.privacy)
     try Self.sqliteExec(
       handle, "INSERT INTO manifest VALUES(1,?,?,?,0)",
       [
         .text(Self.dateString(Date())), .text(options.privacy.rawValue),
         .text(Self.scopeName(options.scope)),
       ])
-    try Self.sqliteExec(handle, "INSERT INTO scan(json) VALUES(?)", [.text(scan)])
+    let scanValues: [SQLiteExportValue] = [
+      .integer(exportedScan.id), .text(exportedScan.rootPath), .text(exportedScan.volumeName),
+      exportedScan.volumeUUID.map(SQLiteExportValue.text) ?? .null,
+      .text(Self.dateString(exportedScan.startedAt)),
+      exportedScan.finishedAt.map { .text(Self.dateString($0)) } ?? .null,
+      .text(exportedScan.state.rawValue), .text(exportedScan.intensity.rawValue),
+      .text(exportedScan.mode.rawValue), .integer(exportedScan.reusedItemCount),
+      .integer(exportedScan.journalComplete ? 1 : 0), .integer(exportedScan.itemCount),
+      .unsigned(exportedScan.logicalBytes), .unsigned(exportedScan.allocatedBytes),
+      .integer(exportedScan.inaccessibleCount),
+    ]
+    try Self.sqliteExec(
+      handle,
+      "INSERT INTO scans(id,root_path,volume_name,volume_uuid,started_at,finished_at,state,intensity,scan_mode,reused_item_count,journal_complete,item_count,logical_bytes,allocated_bytes,inaccessible_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      scanValues)
+    try Self.sqliteExec(
+      handle, "INSERT INTO volumes(scan_id,name,uuid,is_local) VALUES(?,?,?,1)",
+      [.integer(exportedScan.id), .text(exportedScan.volumeName), exportedScan.volumeUUID.map(SQLiteExportValue.text) ?? .null])
+    let rules = RuleEngine.builtInRules + (try await store.loadUserRules())
+    for rule in rules {
+      let ruleJSON = String(decoding: try Self.encoder().encode(rule), as: UTF8.self)
+      try Self.sqliteExec(handle, "INSERT OR REPLACE INTO rules(id,json) VALUES(?,?)", [.text(rule.id), .text(ruleJSON)])
+    }
     try Self.sqliteExec(handle, "BEGIN", [])
-    let itemSQL = "INSERT INTO items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    let itemSQL = "INSERT INTO items(scan_id,id,parent_id,path,name,depth,kind,extension,logical_bytes,allocated_bytes,created_at,modified_at,link_count,is_hidden,is_package,safety_status,rule_id,reason,confidence,source_application,duplicate_group_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     let itemStatement = try Self.sqlitePrepare(handle, itemSQL)
     defer { sqlite3_finalize(itemStatement) }
     var offset = 0
+    var lastID: Int64 = 0
+    let useKeyset = !isSelectionScope(options.scope)
     while true {
-      let page = try await store.fetchItemsPage(
-        scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
+      try Task.checkCancellation()
+      let page = useKeyset
+        ? try await store.fetchItemsPageAfterID(
+          scanID: scanID, scope: options.scope, afterID: lastID, limit: 5_000)
+        : try await store.fetchItemsPage(
+          scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
       if page.isEmpty { break }
       for item in page {
         let path = redactor.redact(item.path)
         try Self.sqliteStep(
           handle, itemStatement, sql: itemSQL,
           values: [
-            .integer(item.id), item.parentID.map(SQLiteExportValue.integer) ?? .null, .text(path),
-            .text(URL(fileURLWithPath: path).lastPathComponent),
+            .integer(scanID), .integer(item.id), item.parentID.map(SQLiteExportValue.integer) ?? .null, .text(path),
+            .text(pathLastComponent(path)),
             .integer(Int64(item.depth)), .text(item.kind.rawValue),
             item.fileExtension.map(SQLiteExportValue.text) ?? .null,
             .unsigned(item.logicalBytes), .unsigned(item.allocatedBytes),
@@ -375,29 +438,30 @@ public actor ScanExporter {
           ])
       }
       offset += page.count
+      if useKeyset { lastID = page.last?.id ?? lastID }
       await onProgress(ExportProgress(exportedItems: offset, bytesWritten: 0))
     }
     try Self.sqliteExec(handle, "COMMIT", [])
     for error in try await store.errors(scanID: scanID) {
       let path = redactor.redact(error.path)
       try Self.sqliteExec(
-        handle, "INSERT INTO scan_errors VALUES(?,?,?)",
+        handle, "INSERT INTO scan_errors(scan_id,path,error_code,message) VALUES(?,?,?,?)",
         [
-          .text(path), .integer(Int64(error.code)),
+          .integer(scanID), .text(path), .integer(Int64(error.code)),
           .text(error.message.replacingOccurrences(of: error.path, with: path)),
         ])
     }
     for group in try await duplicateGroups(scanID: scanID, scope: options.scope) {
       try Self.sqliteExec(
-        handle, "INSERT INTO duplicate_groups VALUES(?,?,?,?)",
+        handle, "INSERT INTO duplicate_groups(scan_id,id,logical_bytes,sha256,reclaimable_bytes) VALUES(?,?,?,?,?)",
         [
-          .integer(group.id), .unsigned(group.logicalBytes),
+          .integer(scanID), .integer(group.id), .unsigned(group.logicalBytes),
           .text(options.privacy == .strict ? "" : group.sha256), .unsigned(group.reclaimableBytes),
         ])
       for member in group.itemIDs {
         try Self.sqliteExec(
-          handle, "INSERT INTO duplicate_members VALUES(?,?)",
-          [.integer(group.id), .integer(member)])
+          handle, "INSERT INTO duplicate_members(scan_id,group_id,item_id) VALUES(?,?,?)",
+          [.integer(scanID), .integer(group.id), .integer(member)])
       }
     }
   }
@@ -437,6 +501,7 @@ public actor ScanExporter {
     } else {
       var offset = 0
       while true {
+        try Task.checkCancellation()
         let page = try await store.fetchItemsPage(
           scanID: scanID, scope: options.scope, limit: 5_000, offset: offset)
         if page.isEmpty { break }
@@ -535,7 +600,7 @@ public actor ScanExporter {
   }
 
   private static func dateString(_ date: Date) -> String {
-    ISO8601DateFormatter().string(from: date)
+    iso8601Formatter.value.string(from: date)
   }
 
   private static func scopeName(_ scope: ExportScope) -> String {
@@ -552,6 +617,7 @@ public actor ScanExporter {
     var memberSizes: [Int64: UInt64] = [:]
     var offset = 0
     while true {
+      try Task.checkCancellation()
       let page = try await store.fetchItemsPage(
         scanID: scanID, scope: scope, limit: 5_000, offset: offset)
       if page.isEmpty { break }
@@ -578,6 +644,16 @@ private enum SQLiteExportValue {
   case unsigned(UInt64)
   case text(String)
   case null
+}
+
+private func isSelectionScope(_ scope: ExportScope) -> Bool {
+  if case .selection = scope { return true }
+  return false
+}
+
+@inline(__always)
+private func pathLastComponent(_ path: String) -> String {
+  path.split(separator: "/", omittingEmptySubsequences: true).last.map(String.init) ?? path
 }
 
 extension ScanExporter {
