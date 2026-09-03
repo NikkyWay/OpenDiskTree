@@ -37,6 +37,9 @@ final class AppModel: ObservableObject {
   @Published var isExporting = false
   @Published var exportProgress: ExportProgress?
   @Published var duplicateProgress: DuplicateProgress?
+  @Published var scanErrors: [ScanErrorRecord] = []
+  @Published var showScanErrors = false
+  @Published var isLoadingScanErrors = false
   @Published var statusMessage = "Choose a folder or disk to begin."
   @Published var errorMessage: String?
   @Published var searchText = ""
@@ -203,6 +206,7 @@ final class AppModel: ObservableObject {
     currentParentID = 1
     navigationStack = []
     selectedItems = []
+    scanErrors = []
     items = []
     directoryItems = []
     loadedDirectoryIDs.removeAll(keepingCapacity: true)
@@ -329,7 +333,13 @@ final class AppModel: ObservableObject {
               }
             }
           },
-          onErrors: { errors in try await store.insert(errors: errors) },
+          onErrors: { [weak self] errors in
+            try await store.insert(errors: errors)
+            Task { @MainActor [weak self] in
+              guard self?.currentScan?.id == record.id else { return }
+              self?.scanErrors.append(contentsOf: errors)
+            }
+          },
           onProgress: { [weak self] update in
             // The core scan must never wait for a complex SwiftUI layout pass.
             // Updates are coalesced naturally by the main run loop.
@@ -508,11 +518,40 @@ final class AppModel: ObservableObject {
     currentParentID = 1
     navigationStack = []
     selectedItems = []
+    scanErrors = []
     loadedDirectoryIDs.removeAll(keepingCapacity: true)
     Task { try? await reloadResults() }
   }
 
   func requestDeleteHistory(_ scan: ScanRecord) { pendingHistoryDeletion = scan }
+
+  func presentScanErrors() {
+    guard currentScan != nil else { return }
+    showScanErrors = true
+    guard !isScanning, let store, let scanID = currentScan?.id else { return }
+    isLoadingScanErrors = true
+    Task {
+      defer { isLoadingScanErrors = false }
+      do {
+        let loaded = try await store.errors(scanID: scanID)
+        guard currentScan?.id == scanID else { return }
+        scanErrors = loaded
+      } catch {
+        errorMessage = error.localizedDescription
+      }
+    }
+  }
+
+  func revealParent(of error: ScanErrorRecord) {
+    var url = URL(fileURLWithPath: error.path)
+    if !FileManager.default.fileExists(atPath: error.path) {
+      url.deleteLastPathComponent()
+    }
+    while url.path != "/", !FileManager.default.fileExists(atPath: url.path) {
+      url.deleteLastPathComponent()
+    }
+    NSWorkspace.shared.activateFileViewerSelecting([url])
+  }
 
   func confirmDeleteHistory() {
     guard let scan = pendingHistoryDeletion, let store else { return }

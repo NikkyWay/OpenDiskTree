@@ -12,6 +12,7 @@ All notable changes to OpenDiskTree are recorded here.
 - Recalculate only affected parent folders after a Trash operation instead of blocking navigation with a full-index aggregation.
 - Finish interrupted snapshot bookkeeping on launch when an item already reached the system Trash.
 - Prevent background history maintenance from removing a recent running scan or the last usable snapshot.
+- Make the inaccessible counter open a searchable error list with copy and Finder actions, including live errors while a scan is running.
 - Add Command- and Shift-click multi-selection with one reviewed Trash operation for the selected batch.
 
 ## 1.3.2 — 2026-08-09

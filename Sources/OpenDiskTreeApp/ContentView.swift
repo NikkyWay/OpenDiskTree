@@ -60,6 +60,9 @@ struct ContentView: View {
     .sheet(isPresented: $model.showRuleEditor) {
       RuleEditorView(rules: model.userRules, previewItems: model.items, onSave: model.saveRules)
     }
+    .sheet(isPresented: $model.showScanErrors) {
+      ScanErrorsView(model: model)
+    }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
@@ -372,11 +375,15 @@ struct ContentView: View {
               .monospacedDigit()
               .foregroundStyle(.secondary)
             if model.progress.inaccessible > 0 {
-              Label(
-                "\(model.progress.inaccessible.formatted()) inaccessible",
-                systemImage: "exclamationmark.triangle"
-              )
+              Button(action: model.presentScanErrors) {
+                Label(
+                  "\(model.progress.inaccessible.formatted()) inaccessible",
+                  systemImage: "exclamationmark.triangle"
+                )
+              }
+              .buttonStyle(.plain)
               .foregroundStyle(.orange)
+              .help("Show paths that could not be scanned")
             }
             Spacer()
             Text(model.statusMessage).foregroundStyle(.secondary)
@@ -401,8 +408,14 @@ struct ContentView: View {
           Label("\(scan.itemCount.formatted()) items", systemImage: "doc.on.doc")
           Label(HumanFormat.size(scan.allocatedBytes), systemImage: "internaldrive")
           if scan.inaccessibleCount > 0 {
-            Label("\(scan.inaccessibleCount) inaccessible", systemImage: "exclamationmark.triangle")
-              .foregroundStyle(.orange)
+            Button(action: model.presentScanErrors) {
+              Label(
+                "\(scan.inaccessibleCount.formatted()) inaccessible",
+                systemImage: "exclamationmark.triangle")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.orange)
+            .help("Show paths that could not be scanned")
           }
         }
         Text(model.statusMessage)
