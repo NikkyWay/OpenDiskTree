@@ -2,6 +2,19 @@
 
 All notable changes to OpenDiskTree are recorded here.
 
+## 1.3.3 — 2026-09-03
+
+- Stop presenting permanent macOS system access denials as actionable scan errors during a full-disk scan.
+- Continue reporting protected user data, explicit folder-scan failures and non-permission I/O errors.
+- Remove previously stored permanent system access denials when opening an older local index.
+- Prevent a slower folder query from restoring stale rows after navigating back to the parent directory.
+- Retry an empty current folder selection and show an explicit loading state instead of an unexplained blank table.
+- Recalculate only affected parent folders after a Trash operation instead of blocking navigation with a full-index aggregation.
+- Finish interrupted snapshot bookkeeping on launch when an item already reached the system Trash.
+- Prevent background history maintenance from removing a recent running scan or the last usable snapshot.
+- Make the inaccessible counter open a searchable error list with copy and Finder actions, including live errors while a scan is running.
+- Add Command- and Shift-click multi-selection with one reviewed Trash operation for the selected batch.
+
 ## 1.3.2 — 2026-08-09
 
 - Apply incremental results directly to the current snapshot instead of copying every unchanged row into another multi-gigabyte snapshot.

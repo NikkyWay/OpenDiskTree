@@ -629,10 +629,14 @@ public actor ScanStore {
       try connection.execute("PRAGMA mmap_size=268435456")
       try connection.execute("BEGIN IMMEDIATE")
       do {
-        // A new process cannot resume a transaction owned by a previous app
-        // process. Remove those abandoned snapshots, plus obsolete partial
-        // snapshots that already have a newer successful replacement.
-        try connection.execute("DELETE FROM scans WHERE state='running'")
+        // Leave recent running rows alone: another OpenDiskTree process may own
+        // them. Only a row that has been abandoned for a full day is eligible.
+        try connection.execute(
+          """
+          DELETE FROM scans
+          WHERE state='running'
+            AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day')
+          """)
         try connection.execute(
           "DELETE FROM scans WHERE state='cancelled' AND item_count=-1")
         try connection.execute(
@@ -658,6 +662,19 @@ public actor ScanStore {
           sql: sql
         )
         try connection.stepDone(statement, sql: sql)
+        let usableCountSQL =
+          "SELECT COUNT(*) FROM scans WHERE state IN ('completed','cancelled','failed') AND item_count>=0"
+        let usableCountStatement = try connection.prepare(usableCountSQL)
+        let usableCount =
+          sqlite3_step(usableCountStatement) == SQLITE_ROW
+          ? sqlite3_column_int64(usableCountStatement, 0) : 0
+        sqlite3_finalize(usableCountStatement)
+        if usableCount == 0 {
+          throw StoreError.sqlite(
+            code: SQLITE_ABORT,
+            message: "History maintenance refused to remove the last usable snapshot.",
+            sql: usableCountSQL)
+        }
         try connection.execute(
           "DELETE FROM cleanup_actions WHERE scan_id NOT IN (SELECT id FROM scans)")
         // Incremental updates mark removed subtrees immediately so foreground
@@ -1054,6 +1071,32 @@ public actor ScanStore {
     )
   }
 
+  /// Finishes snapshot updates when the app stopped after Finder accepted a
+  /// Trash operation but before `markTrashed` could commit its bookkeeping.
+  public func reconcileInterruptedCleanupActions() throws {
+    let sql = """
+      SELECT action.scan_id,action.item_id,action.original_path
+      FROM cleanup_actions action
+      JOIN items item ON item.scan_id=action.scan_id AND item.id=action.item_id
+      WHERE action.outcome='trashed' AND item.is_deleted=0
+      ORDER BY action.id
+      """
+    let statement = try database.prepare(sql)
+    var missingItems: [Int64: [Int64]] = [:]
+    while sqlite3_step(statement) == SQLITE_ROW {
+      let scanID = sqlite3_column_int64(statement, 0)
+      let itemID = sqlite3_column_int64(statement, 1)
+      let path = Self.text(statement, 2) ?? ""
+      if !path.isEmpty, !FileManager.default.fileExists(atPath: path) {
+        missingItems[scanID, default: []].append(itemID)
+      }
+    }
+    sqlite3_finalize(statement)
+    for (scanID, itemIDs) in missingItems {
+      try markTrashed(scanID: scanID, itemIDs: itemIDs)
+    }
+  }
+
   public func errors(scanID: Int64) throws -> [ScanErrorRecord] {
     let sql =
       "SELECT scan_id, path, error_code, message FROM scan_errors WHERE scan_id=? ORDER BY id"
@@ -1233,35 +1276,132 @@ public actor ScanStore {
 
   public func markTrashed(scanID: Int64, itemIDs: [Int64]) throws {
     guard !itemIDs.isEmpty else { return }
+    try database.execute(
+      "CREATE TEMP TABLE IF NOT EXISTS odt_trash_targets(item_id INTEGER PRIMARY KEY)")
+    try database.execute(
+      "CREATE TEMP TABLE IF NOT EXISTS odt_trash_ancestors(item_id INTEGER PRIMARY KEY, depth INTEGER NOT NULL)")
+    try database.execute(
+      "CREATE TEMP TABLE IF NOT EXISTS odt_trash_descendants(item_id INTEGER PRIMARY KEY)")
+    try database.execute(
+      """
+      CREATE TEMP TABLE IF NOT EXISTS odt_folder_rollups(
+        parent_id INTEGER PRIMARY KEY,
+        logical_bytes INTEGER NOT NULL,
+        allocated_bytes INTEGER NOT NULL,
+        risk_rank INTEGER NOT NULL,
+        non_review INTEGER NOT NULL,
+        child_count INTEGER NOT NULL,
+        protected_rule INTEGER NOT NULL
+      )
+      """)
     try database.execute("BEGIN IMMEDIATE")
     do {
-      for id in itemIDs {
+      try database.execute("DELETE FROM odt_trash_targets")
+      try database.execute("DELETE FROM odt_trash_ancestors")
+      try database.execute("DELETE FROM odt_trash_descendants")
+      for id in Set(itemIDs) {
         try executeBound(
-          """
-          WITH RECURSIVE descendants(id) AS (
-            SELECT ?
-            UNION ALL
-            SELECT child.id FROM items child JOIN descendants parent ON child.parent_id=parent.id WHERE child.scan_id=?
-          )
-          UPDATE items SET is_deleted=1 WHERE scan_id=? AND id IN (SELECT id FROM descendants)
-          """, [.integer(id), .integer(scanID), .integer(scanID)])
+          "INSERT OR IGNORE INTO odt_trash_targets(item_id) VALUES(?)", [.integer(id)])
       }
+
+      // Capture only the lineage above the selected rows. The previous implementation
+      // recomputed every directory in a multi-million-item scan after moving one file,
+      // which kept all navigation queries waiting behind the ScanStore actor.
+      try executeBound(
+        """
+        WITH RECURSIVE ancestors(item_id,parent_id,depth) AS (
+          SELECT parent.id,parent.parent_id,parent.depth
+          FROM odt_trash_targets target
+          JOIN items selected ON selected.scan_id=? AND selected.id=target.item_id
+          JOIN items parent ON parent.scan_id=selected.scan_id AND parent.id=selected.parent_id
+          UNION
+          SELECT parent.id,parent.parent_id,parent.depth
+          FROM ancestors child
+          JOIN items parent ON parent.scan_id=? AND parent.id=child.parent_id
+        )
+        INSERT OR IGNORE INTO odt_trash_ancestors(item_id,depth)
+        SELECT item_id,depth FROM ancestors
+        """, [.integer(scanID), .integer(scanID)])
+
+      try executeBound(
+        """
+        WITH RECURSIVE descendants(id) AS (
+          SELECT item.id
+          FROM odt_trash_targets target
+          JOIN items item ON item.scan_id=? AND item.id=target.item_id AND item.is_deleted=0
+          UNION
+          SELECT child.id
+          FROM items child
+          JOIN descendants parent ON child.parent_id=parent.id
+          WHERE child.scan_id=? AND child.is_deleted=0
+        )
+        INSERT OR IGNORE INTO odt_trash_descendants(item_id)
+        SELECT id FROM descendants
+        """, [.integer(scanID), .integer(scanID)])
+      let deletedItemCount = try scalarInt(
+        "SELECT COUNT(*) FROM odt_trash_descendants", [])
+      try executeBound(
+        """
+        UPDATE items SET is_deleted=1
+        WHERE scan_id=? AND id IN (SELECT item_id FROM odt_trash_descendants)
+        """, [.integer(scanID)])
+
+      let maximumAncestorDepth = try scalarInt(
+        "SELECT COALESCE(MAX(depth),-1) FROM odt_trash_ancestors", [])
+      if maximumAncestorDepth >= 0 {
+        for depth in stride(from: maximumAncestorDepth, through: 0, by: -1) {
+          try database.execute("DELETE FROM odt_folder_rollups")
+          try executeBound(
+            """
+            INSERT INTO odt_folder_rollups(
+              parent_id,logical_bytes,allocated_bytes,risk_rank,non_review,child_count,protected_rule
+            )
+            SELECT parent.id,
+              COALESCE(SUM(child.logical_bytes),0),
+              COALESCE(SUM(child.allocated_bytes),0),
+              COALESCE(MAX(CASE child.safety_status
+                WHEN 'do_not_touch' THEN 5
+                WHEN 'delete_via_source_app' THEN 4
+                WHEN 'mixed' THEN 3
+                WHEN 'review' THEN 2
+                WHEN 'recreated_automatically' THEN 1
+                ELSE 0 END),0),
+              COALESCE(SUM(CASE WHEN child.id IS NULL OR child.safety_status='review' THEN 0 ELSE 1 END),0),
+              COUNT(child.id),COALESCE(MAX(child.is_protected_rule),0)
+            FROM odt_trash_ancestors affected
+            JOIN items parent ON parent.scan_id=? AND parent.id=affected.item_id
+            LEFT JOIN items child ON child.scan_id=parent.scan_id
+              AND child.parent_id=parent.id AND child.is_deleted=0
+            WHERE affected.depth=?
+            GROUP BY parent.id
+            """, [.integer(scanID), .integer(depth)])
+          let parentSQL = "SELECT parent_id FROM odt_folder_rollups"
+          let parentStatement = try database.prepare(parentSQL)
+          var parentIDs: [Int64] = []
+          while sqlite3_step(parentStatement) == SQLITE_ROW {
+            parentIDs.append(sqlite3_column_int64(parentStatement, 0))
+          }
+          sqlite3_finalize(parentStatement)
+          for parentID in parentIDs {
+            try updateDirectoriesFromFolderRollups(
+              scanID: scanID, depth: Int(depth), itemID: parentID)
+          }
+        }
+      }
+
+      try executeBound(
+        """
+        UPDATE scans SET
+          item_count=MAX(0,item_count-?),
+          logical_bytes=COALESCE((SELECT logical_bytes FROM items WHERE scan_id=? AND parent_id IS NULL AND is_deleted=0),0),
+          allocated_bytes=COALESCE((SELECT allocated_bytes FROM items WHERE scan_id=? AND parent_id IS NULL AND is_deleted=0),0)
+        WHERE id=?
+        """, [.integer(deletedItemCount), .integer(scanID), .integer(scanID), .integer(scanID)])
       try database.execute("COMMIT")
     } catch {
       try? database.execute("ROLLBACK")
       throw error
     }
-    let maximumDepth = try scalarInt(
-      "SELECT COALESCE(MAX(depth),0) FROM items WHERE scan_id=?", [.integer(scanID)])
-    try aggregateDirectories(scanID: scanID, maximumDepth: Int(maximumDepth))
-    try executeBound(
-      """
-      UPDATE scans SET
-        item_count=(SELECT COUNT(*) FROM items WHERE scan_id=? AND is_deleted=0),
-        logical_bytes=COALESCE((SELECT logical_bytes FROM items WHERE scan_id=? AND parent_id IS NULL),0),
-        allocated_bytes=COALESCE((SELECT allocated_bytes FROM items WHERE scan_id=? AND parent_id IS NULL),0)
-      WHERE id=?
-      """, [.integer(scanID), .integer(scanID), .integer(scanID), .integer(scanID)])
   }
 
   public func loadUserRules() throws -> [CleanupRule] {
@@ -1347,41 +1487,50 @@ public actor ScanStore {
           WHERE parent.scan_id=? AND parent.depth=? AND parent.kind IN ('directory','package')
           GROUP BY parent.id
           """, [.integer(scanID), .integer(Int64(depth))])
-        try executeBound(
-          """
-          UPDATE items AS parent SET
-            logical_bytes = parent.own_logical_bytes + COALESCE((SELECT logical_bytes FROM odt_folder_rollups WHERE parent_id=parent.id),0),
-            allocated_bytes = parent.accounted_allocated_bytes + COALESCE((SELECT allocated_bytes FROM odt_folder_rollups WHERE parent_id=parent.id),0),
-            safety_status = CASE
-              WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.safety_status
-              WHEN rollup.risk_rank=5 THEN 'do_not_touch'
-              WHEN rollup.risk_rank=4 THEN 'delete_via_source_app'
-              WHEN rollup.risk_rank=0 THEN 'safe_to_delete'
-              WHEN rollup.risk_rank<=1 THEN 'recreated_automatically'
-              WHEN rollup.risk_rank=2 AND rollup.non_review=0 THEN 'review'
-              ELSE 'mixed' END,
-            reason = CASE
-              WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.reason
-              WHEN rollup.risk_rank=5 THEN 'This folder contains protected data and must not be removed directly.'
-              WHEN rollup.risk_rank=4 THEN 'This folder contains application-managed data. Use the source application for cleanup.'
-              WHEN rollup.risk_rank=0 THEN 'All scanned contents matched safe cleanup rules.'
-              WHEN rollup.risk_rank<=1 THEN 'All scanned contents are disposable or can be rebuilt automatically.'
-              WHEN rollup.risk_rank=2 AND rollup.non_review=0 THEN 'No trusted cleanup rule matched this folder or its contents.'
-              ELSE 'This folder contains mixed safety statuses. Inspect its contents before cleanup.' END,
-            rule_id = CASE
-              WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.rule_id
-              ELSE 'aggregate.folder' END,
-            is_protected_rule = MAX(parent.is_protected_rule, rollup.protected_rule)
-          FROM odt_folder_rollups rollup
-          WHERE parent.scan_id=? AND parent.depth=? AND parent.kind IN ('directory','package')
-            AND parent.id=rollup.parent_id
-          """, [.integer(scanID), .integer(Int64(depth))])
+        try updateDirectoriesFromFolderRollups(scanID: scanID, depth: depth)
       }
       if ownsTransaction { try database.execute("COMMIT") }
     } catch {
       if ownsTransaction { try? database.execute("ROLLBACK") }
       throw error
     }
+  }
+
+  private func updateDirectoriesFromFolderRollups(
+    scanID: Int64, depth: Int, itemID: Int64? = nil
+  ) throws {
+    let itemClause = itemID == nil ? "" : " AND parent.id=?"
+    var values: [SQLValue] = [.integer(scanID), .integer(Int64(depth))]
+    if let itemID { values.append(.integer(itemID)) }
+    try executeBound(
+      """
+      UPDATE items AS parent SET
+        logical_bytes = parent.own_logical_bytes + COALESCE((SELECT logical_bytes FROM odt_folder_rollups WHERE parent_id=parent.id),0),
+        allocated_bytes = parent.accounted_allocated_bytes + COALESCE((SELECT allocated_bytes FROM odt_folder_rollups WHERE parent_id=parent.id),0),
+        safety_status = CASE
+          WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.safety_status
+          WHEN rollup.risk_rank=5 THEN 'do_not_touch'
+          WHEN rollup.risk_rank=4 THEN 'delete_via_source_app'
+          WHEN rollup.risk_rank=0 THEN 'safe_to_delete'
+          WHEN rollup.risk_rank<=1 THEN 'recreated_automatically'
+          WHEN rollup.risk_rank=2 AND rollup.non_review=0 THEN 'review'
+          ELSE 'mixed' END,
+        reason = CASE
+          WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.reason
+          WHEN rollup.risk_rank=5 THEN 'This folder contains protected data and must not be removed directly.'
+          WHEN rollup.risk_rank=4 THEN 'This folder contains application-managed data. Use the source application for cleanup.'
+          WHEN rollup.risk_rank=0 THEN 'All scanned contents matched safe cleanup rules.'
+          WHEN rollup.risk_rank<=1 THEN 'All scanned contents are disposable or can be rebuilt automatically.'
+          WHEN rollup.risk_rank=2 AND rollup.non_review=0 THEN 'No trusted cleanup rule matched this folder or its contents.'
+          ELSE 'This folder contains mixed safety statuses. Inspect its contents before cleanup.' END,
+        rule_id = CASE
+          WHEN parent.is_protected_rule=1 AND parent.safety_status IN ('do_not_touch','delete_via_source_app') THEN parent.rule_id
+          ELSE 'aggregate.folder' END,
+        is_protected_rule = MAX(parent.is_protected_rule, rollup.protected_rule)
+      FROM odt_folder_rollups rollup
+      WHERE parent.scan_id=? AND parent.depth=? AND parent.kind IN ('directory','package')
+        AND parent.id=rollup.parent_id\(itemClause)
+      """, values)
   }
 
   /// Applies the scanner's single-pass bottom-up aggregation. The previous SQL
@@ -1673,6 +1822,52 @@ public actor ScanStore {
       try? database.execute(
         "ALTER TABLE scans ADD COLUMN journal_complete INTEGER NOT NULL DEFAULT 1")
       try database.execute("PRAGMA user_version=3")
+    }
+    if version < 4 {
+      try removeExpectedFullDiskAccessErrors(database)
+      try database.execute("PRAGMA user_version=4")
+    }
+  }
+
+  private static func removeExpectedFullDiskAccessErrors(_ database: SQLiteConnection) throws {
+    let query = """
+      SELECT error.id,error.path,error.error_code
+      FROM scan_errors AS error
+      JOIN scans AS scan ON scan.id=error.scan_id
+      WHERE scan.root_path='/'
+      """
+    let statement = try database.prepare(query)
+    defer { sqlite3_finalize(statement) }
+    var removableIDs: [Int64] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+      let id = sqlite3_column_int64(statement, 0)
+      let path = text(statement, 1) ?? ""
+      let code = sqlite3_column_int(statement, 2)
+      if !DiskScanner.shouldReportDirectoryReadError(path: path, rootPath: "/", code: code) {
+        removableIDs.append(id)
+      }
+    }
+    guard !removableIDs.isEmpty else { return }
+
+    try database.execute("BEGIN IMMEDIATE")
+    do {
+      let deleteSQL = "DELETE FROM scan_errors WHERE id=?"
+      let deleteStatement = try database.prepare(deleteSQL)
+      defer { sqlite3_finalize(deleteStatement) }
+      for id in removableIDs {
+        try database.bind([.integer(id)], to: deleteStatement, sql: deleteSQL)
+        try database.stepDone(deleteStatement, sql: deleteSQL)
+      }
+      try database.execute(
+        """
+        UPDATE scans SET inaccessible_count=(
+          SELECT COUNT(*) FROM scan_errors WHERE scan_errors.scan_id=scans.id
+        ) WHERE root_path='/'
+        """)
+      try database.execute("COMMIT")
+    } catch {
+      try? database.execute("ROLLBACK")
+      throw error
     }
   }
 

@@ -4,19 +4,19 @@ import SwiftUI
 
 struct ResultsTableView: NSViewRepresentable {
   let items: [ScannedItem]
-  let selectedID: Int64?
+  let selectedIDs: Set<Int64>
   let isScanning: Bool
-  let onSelect: (ScannedItem?) -> Void
+  let onSelect: ([ScannedItem]) -> Void
   let onOpen: (ScannedItem) -> Void
   let onReveal: (ScannedItem) -> Void
-  let onTrash: (ScannedItem) -> Void
+  let onTrash: ([ScannedItem]) -> Void
 
   func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
   func makeNSView(context: Context) -> NSScrollView {
     let table = NSTableView()
     table.usesAlternatingRowBackgroundColors = true
-    table.allowsMultipleSelection = false
+    table.allowsMultipleSelection = true
     table.rowHeight = 24
     table.intercellSpacing = NSSize(width: 8, height: 1)
     table.delegate = context.coordinator
@@ -94,14 +94,13 @@ struct ResultsTableView: NSViewRepresentable {
         renderedIsScanning = parent.isScanning
         table.reloadData()
       }
-      let desiredRow = parent.selectedID.flatMap { id in
-        parent.items.firstIndex(where: { $0.id == id })
-      }
-      if let desiredRow {
-        if table.selectedRow != desiredRow {
-          table.selectRowIndexes(IndexSet(integer: desiredRow), byExtendingSelection: false)
+      let desiredRows = IndexSet(
+        parent.items.indices.filter { parent.selectedIDs.contains(parent.items[$0].id) })
+      if !desiredRows.isEmpty {
+        if table.selectedRowIndexes != desiredRows {
+          table.selectRowIndexes(desiredRows, byExtendingSelection: false)
         }
-      } else if table.selectedRow >= 0 {
+      } else if !table.selectedRowIndexes.isEmpty {
         table.deselectAll(nil)
       }
     }
@@ -155,12 +154,11 @@ struct ResultsTableView: NSViewRepresentable {
 
     func tableViewSelectionDidChange(_ notification: Notification) {
       guard !isSynchronizingSelection else { return }
-      guard let row = table?.selectedRow, row >= 0, row < parent.items.count else {
-        if parent.selectedID != nil { parent.onSelect(nil) }
-        return
+      guard let table else { return }
+      let selection = table.selectedRowIndexes.compactMap { row in
+        row < parent.items.count ? parent.items[row] : nil
       }
-      let item = parent.items[row]
-      if item.id != parent.selectedID { parent.onSelect(item) }
+      if Set(selection.map(\.id)) != parent.selectedIDs { parent.onSelect(selection) }
     }
 
     @objc func doubleClick() {
@@ -169,12 +167,28 @@ struct ResultsTableView: NSViewRepresentable {
     }
 
     @objc func reveal() { if let item = selectedItem { parent.onReveal(item) } }
-    @objc func trash() { if let item = selectedItem { parent.onTrash(item) } }
+    @objc func trash() {
+      let items = contextualItems
+      if !items.isEmpty { parent.onTrash(items) }
+    }
 
     private var selectedItem: ScannedItem? {
       guard let row = table?.clickedRow ?? table?.selectedRow, row >= 0, row < parent.items.count
       else { return nil }
       return parent.items[row]
+    }
+
+    private var contextualItems: [ScannedItem] {
+      guard let table else { return [] }
+      let clickedRow = table.clickedRow
+      if clickedRow >= 0, clickedRow < parent.items.count,
+        !table.selectedRowIndexes.contains(clickedRow)
+      {
+        return [parent.items[clickedRow]]
+      }
+      return table.selectedRowIndexes.compactMap { row in
+        row < parent.items.count ? parent.items[row] : nil
+      }
     }
   }
 }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CSQLite
 import Testing
@@ -86,6 +87,28 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
   #expect(
     DiskScanner.shouldTraverseDirectory(
       rootDeviceID: 10, entryDeviceID: 11, isMountPoint: true, crossSelectedVolume: true))
+}
+
+@Test func fullDiskScanDoesNotReportPermanentSystemAccessDenials() {
+  #expect(
+    !DiskScanner.shouldReportDirectoryReadError(
+      path: "/System/Library/Caches/com.apple.some-service", rootPath: "/", code: EPERM))
+  #expect(
+    !DiskScanner.shouldReportDirectoryReadError(
+      path: "/private/var/db/fseventsd", rootPath: "/", code: EACCES))
+  #expect(
+    !DiskScanner.shouldReportDirectoryReadError(
+      path: "/Library/Caches/com.apple.aned", rootPath: "/", code: EPERM))
+
+  #expect(
+    DiskScanner.shouldReportDirectoryReadError(
+      path: "/Users/example/Library/Mail", rootPath: "/", code: EPERM))
+  #expect(
+    DiskScanner.shouldReportDirectoryReadError(
+      path: "/private/var/db/fseventsd", rootPath: "/private/var", code: EACCES))
+  #expect(
+    DiskScanner.shouldReportDirectoryReadError(
+      path: "/System/Library", rootPath: "/", code: EIO))
 }
 
 @Test func cancelledSnapshotUsesLiveProgressTotals() async throws {
@@ -530,6 +553,67 @@ private func scanFixture(_ root: URL, databaseURL: URL) async throws -> (ScanSto
     await store.fetchLargest(scanID: scan.id, containers: false, limit: 1).first)
   try await store.markTrashed(scanID: scan.id, itemIDs: [file.id])
   let updated = try #require(await store.fetchScan(scan.id))
+  #expect(updated.logicalBytes == 0)
+  #expect(updated.allocatedBytes == 0)
+}
+
+@Test func trashRecalculatesOnlyAffectedAncestorTotals() async throws {
+  let workspace = try TestWorkspace()
+  defer { workspace.remove() }
+  let root = workspace.url.appendingPathComponent("selective-cleanup", isDirectory: true)
+  let removedDirectory = root.appendingPathComponent("removed", isDirectory: true)
+  let retainedDirectory = root.appendingPathComponent("retained", isDirectory: true)
+  try FileManager.default.createDirectory(at: removedDirectory, withIntermediateDirectories: true)
+  try FileManager.default.createDirectory(at: retainedDirectory, withIntermediateDirectories: true)
+  try write(
+    String(repeating: "x", count: 8_192),
+    to: removedDirectory.appendingPathComponent("cache.bin"))
+  try write(
+    String(repeating: "y", count: 16_384),
+    to: retainedDirectory.appendingPathComponent("keep.bin"))
+
+  let (store, scan) = try await scanFixture(
+    root, databaseURL: workspace.url.appendingPathComponent("selective-cleanup.sqlite"))
+  let rootChildren = try await store.fetchChildren(scanID: scan.id, parentID: 1)
+  let removed = try #require(rootChildren.first { $0.name == "removed" })
+  let retainedBefore = try #require(rootChildren.first { $0.name == "retained" })
+  let removedFile = try #require(
+    await store.fetchChildren(scanID: scan.id, parentID: removed.id).first)
+
+  try await store.markTrashed(scanID: scan.id, itemIDs: [removedFile.id])
+
+  let removedAfter = try #require(await store.fetchItem(scanID: scan.id, itemID: removed.id))
+  let retainedAfter = try #require(await store.fetchItem(scanID: scan.id, itemID: retainedBefore.id))
+  let rootAfter = try #require(await store.fetchItem(scanID: scan.id, itemID: 1))
+  #expect(removedAfter.logicalBytes == 0)
+  #expect(removedAfter.allocatedBytes == 0)
+  #expect(retainedAfter.logicalBytes == retainedBefore.logicalBytes)
+  #expect(retainedAfter.allocatedBytes == retainedBefore.allocatedBytes)
+  #expect(rootAfter.logicalBytes == retainedAfter.logicalBytes)
+  #expect(rootAfter.allocatedBytes == retainedAfter.allocatedBytes)
+}
+
+@Test func interruptedTrashBookkeepingIsRecoveredOnLaunch() async throws {
+  let workspace = try TestWorkspace()
+  defer { workspace.remove() }
+  let root = workspace.url.appendingPathComponent("interrupted-cleanup", isDirectory: true)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  let fileURL = root.appendingPathComponent("already-moved.bin")
+  try write(String(repeating: "x", count: 8_192), to: fileURL)
+  let (store, scan) = try await scanFixture(
+    root, databaseURL: workspace.url.appendingPathComponent("interrupted-cleanup.sqlite"))
+  let file = try #require(
+    await store.fetchLargest(scanID: scan.id, containers: false, limit: 1).first)
+
+  try await store.recordCleanupAction(
+    scanID: scan.id, item: file, outcome: "trashed", message: nil)
+  try FileManager.default.removeItem(at: fileURL)
+  try await store.reconcileInterruptedCleanupActions()
+
+  let visibleChildren = try await store.fetchChildren(scanID: scan.id, parentID: 1)
+  let updated = try #require(await store.fetchScan(scan.id))
+  #expect(visibleChildren.isEmpty)
+  #expect(updated.itemCount == 1)
   #expect(updated.logicalBytes == 0)
   #expect(updated.allocatedBytes == 0)
 }

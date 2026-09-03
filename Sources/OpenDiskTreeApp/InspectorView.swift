@@ -2,14 +2,14 @@ import OpenDiskTreeCore
 import SwiftUI
 
 struct InspectorView: View {
-  let item: ScannedItem?
+  let items: [ScannedItem]
   let onReveal: (ScannedItem) -> Void
-  let onTrash: (ScannedItem) -> Void
+  let onTrash: ([ScannedItem]) -> Void
   let onOpenSourceApp: (ScannedItem) -> Void
 
   var body: some View {
     Group {
-      if let item {
+      if items.count == 1, let item = items.first {
         ScrollView {
           VStack(alignment: .leading, spacing: 14) {
             Label(
@@ -37,9 +37,34 @@ struct InspectorView: View {
               Label(String(localized: "action.reveal"), systemImage: "finder")
             }
             Button(role: .destructive) {
-              onTrash(item)
+              onTrash(items)
             } label: {
               Label(String(localized: "action.trash"), systemImage: "trash")
+            }
+          }
+          .padding()
+        }
+      } else if !items.isEmpty {
+        ScrollView {
+          VStack(alignment: .leading, spacing: 14) {
+            Label("\(items.count.formatted()) items selected", systemImage: "checkmark.circle")
+              .font(.headline)
+            LabeledContent("On disk", value: HumanFormat.size(totalAllocatedBytes))
+            LabeledContent("Logical", value: HumanFormat.size(totalLogicalBytes))
+            Divider()
+            ForEach(statusCounts, id: \.status) { entry in
+              HStack {
+                Label(entry.status.localizedTitle, systemImage: entry.status.symbol)
+                  .foregroundStyle(entry.status.color)
+                Spacer()
+                Text(entry.count.formatted()).monospacedDigit()
+              }
+            }
+            Divider()
+            Button(role: .destructive) {
+              onTrash(items)
+            } label: {
+              Label("Move selected to Trash", systemImage: "trash")
             }
           }
           .padding()
@@ -51,5 +76,19 @@ struct InspectorView: View {
       }
     }
     .frame(minWidth: 220, idealWidth: 250)
+  }
+
+  private var totalAllocatedBytes: UInt64 {
+    items.reduce(0) { $0 &+ $1.allocatedBytes }
+  }
+
+  private var totalLogicalBytes: UInt64 {
+    items.reduce(0) { $0 &+ $1.logicalBytes }
+  }
+
+  private var statusCounts: [(status: SafetyStatus, count: Int)] {
+    Dictionary(grouping: items, by: \.classification.status)
+      .map { (status: $0.key, count: $0.value.count) }
+      .sorted { $0.status.riskRank > $1.status.riskRank }
   }
 }
