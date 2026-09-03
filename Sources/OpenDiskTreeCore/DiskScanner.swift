@@ -303,14 +303,20 @@ public final class DiskScanner: Sendable {
 
         progress.currentPath = outcome.directory.path
         if let error = outcome.error {
-          progress.inaccessible += 1
-          errors.append(
-            ScanErrorRecord(
-              scanID: scanID,
-              path: outcome.directory.path,
-              code: error.code,
-              message: error.message
-            ))
+          if Self.shouldReportDirectoryReadError(
+            path: outcome.directory.path,
+            rootPath: rootPath,
+            code: error.code
+          ) {
+            progress.inaccessible += 1
+            errors.append(
+              ScanErrorRecord(
+                scanID: scanID,
+                path: outcome.directory.path,
+                code: error.code,
+                message: error.message
+              ))
+          }
         } else if let listing = outcome.listing {
           if listing.usedBulkAPI { bulkCount += 1 } else { fallbackCount += 1 }
 
@@ -618,5 +624,26 @@ public final class DiskScanner: Sendable {
       "/Network", "/net", "/home", "/dev",
     ]
     return excluded.contains(where: { path == $0 || path.hasPrefix($0 + "/") })
+  }
+
+  static func shouldReportDirectoryReadError(path: String, rootPath: String, code: Int32) -> Bool {
+    guard rootPath == "/", code == EACCES || code == EPERM else { return true }
+
+    // A non-privileged macOS app cannot traverse these system-owned locations,
+    // even with Full Disk Access. They are expected gaps in a full-disk scan,
+    // not actionable scan failures. Explicit folder scans still report them.
+    let protectedSystemPaths = [
+      "/System",
+      "/private/var",
+      "/private/etc/cups/certs",
+      "/usr/sbin/authserver",
+      "/Library/Application Support/Apple/AssetCache/Data",
+      "/Library/Application Support/Apple/ParentalControls/Users",
+      "/Library/Caches/com.apple.amsengagementd.classicdatavault",
+      "/Library/Caches/com.apple.aned",
+      "/Library/Caches/com.apple.aneuserd",
+      "/Library/Caches/com.apple.iconservices.store",
+    ]
+    return !protectedSystemPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
   }
 }

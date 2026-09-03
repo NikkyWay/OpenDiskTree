@@ -26,10 +26,11 @@ final class AppModel: ObservableObject {
   @Published var currentScan: ScanRecord?
   @Published var items: [ScannedItem] = []
   @Published var directoryItems: [ScannedItem] = []
-  @Published var selectedItem: ScannedItem?
+  @Published var selectedItems: [ScannedItem] = []
   @Published var showingLargestItems = false
   @Published var progress = ScanProgress()
   @Published var isScanning = false
+  @Published var isLoadingResults = false
   @Published var isPreliminary = false
   @Published var isPaused = false
   @Published var isFindingDuplicates = false
@@ -52,7 +53,7 @@ final class AppModel: ObservableObject {
   @Published var sort: ItemSort = .allocatedSize
   @Published var currentParentID: Int64?
   @Published var navigationStack: [ScannedItem] = []
-  @Published var pendingTrash: ScannedItem?
+  @Published var pendingTrashItems: [ScannedItem] = []
   @Published var pendingTrashNeedsRiskConfirmation = false
   @Published var pendingHistoryDeletion: ScanRecord?
   @Published var userRules: [CleanupRule] = []
@@ -75,6 +76,7 @@ final class AppModel: ObservableObject {
   private var maintenanceTask: Task<Void, Never>?
   private var activeSecurityScopedURL: URL?
   private var loadedDirectoryIDs = Set<Int64>()
+  private var resultsReloadGeneration: UInt64 = 0
   private let bookmarkDefaultsKey = "securityScopedScanBookmarks"
   private let journalDefaultsKey = "fseventsBaselineIDs"
   private let duplicateFinder = DuplicateFinder()
@@ -107,6 +109,33 @@ final class AppModel: ObservableObject {
   var intensity: ScanIntensity {
     get { ScanIntensity(rawValue: intensityRaw) ?? .turbo }
     set { intensityRaw = newValue.rawValue }
+  }
+
+  var selectedItem: ScannedItem? { selectedItems.first }
+  var selectedItemIDs: Set<Int64> { Set(selectedItems.map(\.id)) }
+
+  var pendingTrashTitle: String {
+    if pendingTrashNeedsRiskConfirmation {
+      return pendingTrashItems.count == 1
+        ? "This item is not classified as safe"
+        : "Some selected items are not classified as safe"
+    }
+    return pendingTrashItems.count == 1
+      ? "Move this item to the Trash?"
+      : "Move \(pendingTrashItems.count.formatted()) items to the Trash?"
+  }
+
+  var pendingTrashSummary: String {
+    guard !pendingTrashItems.isEmpty else { return "" }
+    if let item = pendingTrashItems.first, pendingTrashItems.count == 1 {
+      return "\(item.path)\n\n\(item.classification.reason)"
+    }
+    let bytes = pendingTrashItems.reduce(UInt64(0)) { $0 &+ $1.allocatedBytes }
+    let statuses = Dictionary(grouping: pendingTrashItems, by: \.classification.status)
+      .sorted { $0.key.riskRank > $1.key.riskRank }
+      .map { "\($0.key.localizedTitle): \($0.value.count.formatted())" }
+      .joined(separator: "\n")
+    return "Total on disk: \(HumanFormat.size(bytes))\n\n\(statuses)"
   }
 
   var filter: ItemFilter {
@@ -173,7 +202,7 @@ final class AppModel: ObservableObject {
     currentScan = nil
     currentParentID = 1
     navigationStack = []
-    selectedItem = nil
+    selectedItems = []
     items = []
     directoryItems = []
     loadedDirectoryIDs.removeAll(keepingCapacity: true)
@@ -259,7 +288,7 @@ final class AppModel: ObservableObject {
         isPreliminary = false
         currentParentID = 1
         navigationStack = []
-        selectedItem = nil
+        selectedItems = []
         let root = try DiskScanner.makeRootItem(scanID: record.id, id: 1, url: url, engine: engine)
         try await store.insert([root])
         let batchWriter = ScanBatchWriter(store: store)
@@ -478,7 +507,7 @@ final class AppModel: ObservableObject {
     showingLargestItems = false
     currentParentID = 1
     navigationStack = []
-    selectedItem = nil
+    selectedItems = []
     loadedDirectoryIDs.removeAll(keepingCapacity: true)
     Task { try? await reloadResults() }
   }
@@ -495,7 +524,7 @@ final class AppModel: ObservableObject {
           currentScan = nil
           items = []
           directoryItems = []
-          selectedItem = nil
+          selectedItems = []
         }
         await loadRecentScans()
         statusMessage = "Scan snapshot removed. Files on disk were not changed."
@@ -505,17 +534,30 @@ final class AppModel: ObservableObject {
 
   func reloadResults() async throws {
     guard let store, let scanID = currentScan?.id else { return }
+    resultsReloadGeneration &+= 1
+    let generation = resultsReloadGeneration
+    isLoadingResults = true
+    defer {
+      if resultsReloadGeneration == generation { isLoadingResults = false }
+    }
     let parent = currentParentID ?? 1
+    let requestedFilter = filter
+    let requestedSort = sort
+    let requestedLargestItems = showingLargestItems
     let loadedItems: [ScannedItem]
-    if showingLargestItems {
+    if requestedLargestItems {
       loadedItems = try await store.fetchLargest(
-        scanID: scanID, containers: false, filter: filter, sort: sort, limit: 2_000)
+        scanID: scanID, containers: false, filter: requestedFilter, sort: requestedSort, limit: 2_000)
     } else {
       loadedItems = try await store.fetchChildren(
-        scanID: scanID, parentID: parent, filter: filter, sort: sort)
+        scanID: scanID, parentID: parent, filter: requestedFilter, sort: requestedSort)
     }
+    guard resultsRequestIsCurrent(
+      generation: generation, scanID: scanID, parentID: parent,
+      filter: requestedFilter, sort: requestedSort, showingLargestItems: requestedLargestItems
+    ) else { return }
     if items != loadedItems { items = loadedItems }
-    if !showingLargestItems && (directoryItems.isEmpty || parent == 1) {
+    if !requestedLargestItems && (directoryItems.isEmpty || parent == 1) {
       // Do not decode thousands of directory rows just to open the last snapshot.
       // The outline starts with the root and its immediate children; deeper
       // branches are reached through the table and are loaded on demand.
@@ -528,14 +570,16 @@ final class AppModel: ObservableObject {
       } else {
         loadedDirectories = []
       }
+      guard resultsRequestIsCurrent(
+        generation: generation, scanID: scanID, parentID: parent,
+        filter: requestedFilter, sort: requestedSort, showingLargestItems: requestedLargestItems
+      ) else { return }
       if directoryItems != loadedDirectories { directoryItems = loadedDirectories }
     }
-    if let selectedItem {
-      if let refreshed = loadedItems.first(where: { $0.id == selectedItem.id }) {
-        if refreshed != selectedItem { self.selectedItem = refreshed }
-      } else {
-        self.selectedItem = nil
-      }
+    if !selectedItems.isEmpty {
+      let loadedByID = Dictionary(uniqueKeysWithValues: loadedItems.map { ($0.id, $0) })
+      let refreshedSelection = selectedItems.compactMap { loadedByID[$0.id] }
+      if refreshedSelection != selectedItems { selectedItems = refreshedSelection }
     }
   }
 
@@ -568,7 +612,9 @@ final class AppModel: ObservableObject {
     showingLargestItems = true
     currentParentID = 1
     navigationStack = []
-    selectedItem = nil
+    selectedItems = []
+    items = []
+    isLoadingResults = true
     statusMessage = "Showing the largest files in this scan."
     Task { try? await reloadResults() }
   }
@@ -576,36 +622,66 @@ final class AppModel: ObservableObject {
   func navigate(into item: ScannedItem) {
     showingLargestItems = false
     guard item.kind.canHaveChildren else {
-      selectedItem = item
+      selectedItems = [item]
       return
     }
     navigationStack.append(item)
     currentParentID = item.id
-    selectedItem = nil
+    selectedItems = []
+    items = []
+    isLoadingResults = true
     Task { try? await reloadResults() }
   }
 
   func navigateFromTree(_ item: ScannedItem) {
     showingLargestItems = false
     guard currentParentID != item.id else {
-      if selectedItem != item { selectedItem = item }
+      if selectedItems != [item] { selectedItems = [item] }
+      if items.isEmpty {
+        isLoadingResults = true
+        Task { try? await reloadResults() }
+      }
       return
     }
     currentParentID = item.id
     navigationStack = [item]
-    selectedItem = item
+    selectedItems = [item]
+    items = []
+    isLoadingResults = true
     Task { try? await reloadResults() }
   }
 
   func selectItem(_ item: ScannedItem?) {
-    if selectedItem != item { selectedItem = item }
+    selectItems(item.map { [$0] } ?? [])
+  }
+
+  func selectItems(_ items: [ScannedItem]) {
+    if selectedItems != items { selectedItems = items }
   }
 
   func navigateBack() {
     if !navigationStack.isEmpty { navigationStack.removeLast() }
     currentParentID = navigationStack.last?.id ?? 1
-    selectedItem = nil
+    selectedItems = []
+    items = []
+    isLoadingResults = true
     Task { try? await reloadResults() }
+  }
+
+  private func resultsRequestIsCurrent(
+    generation: UInt64,
+    scanID: Int64,
+    parentID: Int64,
+    filter requestedFilter: ItemFilter,
+    sort requestedSort: ItemSort,
+    showingLargestItems requestedLargestItems: Bool
+  ) -> Bool {
+    resultsReloadGeneration == generation
+      && currentScan?.id == scanID
+      && (currentParentID ?? 1) == parentID
+      && filter == requestedFilter
+      && sort.rawValue == requestedSort.rawValue
+      && showingLargestItems == requestedLargestItems
   }
 
   func reveal(_ item: ScannedItem) {
@@ -618,46 +694,88 @@ final class AppModel: ObservableObject {
     }
   }
 
-  func requestTrash(_ item: ScannedItem) {
-    switch FileActionPolicy.trashAuthorization(for: item, strictMode: strictDeletion) {
-    case .allowed:
-      pendingTrashNeedsRiskConfirmation = false
-      pendingTrash = item
-    case .requiresRiskConfirmation:
-      pendingTrashNeedsRiskConfirmation = true
-      pendingTrash = item
-    case .blocked(let reason):
-      errorMessage = reason
+  func requestTrash(_ item: ScannedItem) { requestTrash([item]) }
+
+  func requestTrash(_ requestedItems: [ScannedItem]) {
+    var seen = Set<Int64>()
+    let uniqueItems = requestedItems.filter { seen.insert($0.id).inserted }
+    guard !uniqueItems.isEmpty else { return }
+
+    var needsRiskConfirmation = false
+    for item in uniqueItems {
+      switch FileActionPolicy.trashAuthorization(for: item, strictMode: strictDeletion) {
+      case .allowed:
+        break
+      case .requiresRiskConfirmation:
+        needsRiskConfirmation = true
+      case .blocked(let reason):
+        errorMessage = uniqueItems.count == 1 ? reason : "\(item.name): \(reason)"
+        return
+      }
     }
+    pendingTrashNeedsRiskConfirmation = needsRiskConfirmation
+    pendingTrashItems = uniqueItems
   }
 
   func confirmTrash() {
-    guard let item = pendingTrash, let store, let scanID = currentScan?.id else { return }
-    pendingTrash = nil
+    let requestedItems = pendingTrashItems
+    guard !requestedItems.isEmpty, let store, let scanID = currentScan?.id else { return }
+    pendingTrashItems = []
     Task {
-      var resultingURL: NSURL?
-      do {
-        guard FileActionPolicy.currentIdentityMatches(item) else {
-          throw CocoaError(
-            .fileNoSuchFile,
-            userInfo: [
-              NSLocalizedDescriptionKey:
-                "The item changed after the scan. Scan again before moving it to the Trash."
-            ])
+      var trashedIDs: [Int64] = []
+      var failures: [String] = []
+      for item in requestedItems {
+        var resultingURL: NSURL?
+        do {
+          guard FileActionPolicy.currentIdentityMatches(item) else {
+            throw CocoaError(
+              .fileNoSuchFile,
+              userInfo: [
+                NSLocalizedDescriptionKey:
+                  "The item changed after the scan. Scan again before moving it to the Trash."
+              ])
+          }
+          try FileManager.default.trashItem(
+            at: URL(fileURLWithPath: item.path), resultingItemURL: &resultingURL)
+          try await store.recordCleanupAction(
+            scanID: scanID, item: item, outcome: "trashed", message: resultingURL?.path)
+          trashedIDs.append(item.id)
+        } catch {
+          try? await store.recordCleanupAction(
+            scanID: scanID, item: item, outcome: "failed", message: error.localizedDescription)
+          failures.append("\(item.name): \(error.localizedDescription)")
         }
-        try FileManager.default.trashItem(
-          at: URL(fileURLWithPath: item.path), resultingItemURL: &resultingURL)
-        try await store.recordCleanupAction(
-          scanID: scanID, item: item, outcome: "trashed", message: resultingURL?.path)
-        try await store.markTrashed(scanID: scanID, itemIDs: [item.id])
-        statusMessage = "Moved \(item.name) to the Trash."
+      }
+      if !trashedIDs.isEmpty {
+        do {
+          try await store.markTrashed(scanID: scanID, itemIDs: trashedIDs)
+        } catch {
+          failures.append("Could not update the scan snapshot: \(error.localizedDescription)")
+        }
+      }
+      selectedItems.removeAll { trashedIDs.contains($0.id) }
+      if let refreshedScan = try? await store.fetchScan(scanID), currentScan?.id == scanID {
+        currentScan = refreshedScan
+      }
+      if failures.isEmpty {
+        statusMessage = trashedIDs.count == 1
+          ? "Moved one item to the Trash."
+          : "Moved \(trashedIDs.count.formatted()) items to the Trash."
+      } else {
+        statusMessage = "Moved \(trashedIDs.count.formatted()) of \(requestedItems.count.formatted()) items to the Trash."
+        errorMessage = failures.prefix(8).joined(separator: "\n")
+      }
+      do {
         try await reloadResults()
       } catch {
-        try? await store.recordCleanupAction(
-          scanID: scanID, item: item, outcome: "failed", message: error.localizedDescription)
         errorMessage = error.localizedDescription
       }
     }
+  }
+
+  func cancelPendingTrash() {
+    pendingTrashItems = []
+    pendingTrashNeedsRiskConfirmation = false
   }
 
   func findDuplicates() {
@@ -767,10 +885,15 @@ final class AppModel: ObservableObject {
   }
 
   private func bootstrap() async {
-    await loadRecentScans()
     if let store {
+      do {
+        try await store.reconcileInterruptedCleanupActions()
+      } catch {
+        errorMessage = "Could not finish a previous Trash update: \(error.localizedDescription)"
+      }
       userRules = (try? await store.loadUserRules()) ?? []
     }
+    await loadRecentScans()
   }
 
   private func loadRecentScans() async {

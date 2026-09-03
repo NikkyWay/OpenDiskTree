@@ -34,18 +34,16 @@ struct ContentView: View {
       Text(model.errorMessage ?? "")
     }
     .confirmationDialog(
-      model.pendingTrashNeedsRiskConfirmation
-        ? "This item is not classified as safe" : "Move this item to the Trash?",
+      model.pendingTrashTitle,
       isPresented: Binding(
-        get: { model.pendingTrash != nil }, set: { if !$0 { model.pendingTrash = nil } }),
+        get: { !model.pendingTrashItems.isEmpty },
+        set: { if !$0 { model.cancelPendingTrash() } }),
       titleVisibility: .visible
     ) {
       Button("Move to Trash", role: .destructive) { model.confirmTrash() }
-      Button("Cancel", role: .cancel) { model.pendingTrash = nil }
+      Button("Cancel", role: .cancel) { model.cancelPendingTrash() }
     } message: {
-      if let item = model.pendingTrash {
-        Text("\(item.path)\n\n\(item.classification.reason)")
-      }
+      Text(model.pendingTrashSummary)
     }
     .confirmationDialog(
       "Remove this scan snapshot?",
@@ -276,9 +274,11 @@ struct ContentView: View {
       Divider()
       Menu("Complete scan") { exportButtons(scope: .entireScan) }
       Menu("Current filter") { exportButtons(scope: .filtered(model.filter)) }
-      if let item = model.selectedItem {
-        Menu("Selected item") {
-          exportButtons(scope: .selection(itemIDs: [item.id], includeDescendants: true))
+      if !model.selectedItems.isEmpty {
+        Menu(model.selectedItems.count == 1 ? "Selected item" : "Selected items") {
+          exportButtons(
+            scope: .selection(
+              itemIDs: model.selectedItems.map(\.id), includeDescendants: true))
         }
       }
     } label: {
@@ -305,15 +305,23 @@ struct ContentView: View {
       )
       .frame(minWidth: 150, idealWidth: 185, maxWidth: 235, maxHeight: .infinity)
       VSplitView {
-        ResultsTableView(
-          items: model.items,
-          selectedID: model.selectedItem?.id,
-          isScanning: model.isScanning,
-          onSelect: model.selectItem,
-          onOpen: { $0.kind.canHaveChildren ? model.navigate(into: $0) : model.reveal($0) },
-          onReveal: model.reveal,
-          onTrash: model.requestTrash
-        )
+        ZStack {
+          ResultsTableView(
+            items: model.items,
+            selectedIDs: model.selectedItemIDs,
+            isScanning: model.isScanning,
+            onSelect: model.selectItems,
+            onOpen: { $0.kind.canHaveChildren ? model.navigate(into: $0) : model.reveal($0) },
+            onReveal: model.reveal,
+            onTrash: model.requestTrash
+          )
+          if model.isLoadingResults && !model.isScanning {
+            ProgressView("Loading folder…")
+              .padding(.horizontal, 18)
+              .padding(.vertical, 12)
+              .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+          }
+        }
         .frame(minWidth: 400, minHeight: 260, idealHeight: 390, maxHeight: .infinity)
         TreemapView(
           items: model.items,
@@ -327,7 +335,7 @@ struct ContentView: View {
       }
       .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
       InspectorView(
-        item: model.selectedItem, onReveal: model.reveal, onTrash: model.requestTrash,
+        items: model.selectedItems, onReveal: model.reveal, onTrash: model.requestTrash,
         onOpenSourceApp: model.openSourceApplication
       )
       .frame(minWidth: 220, idealWidth: 245, maxWidth: 285, maxHeight: .infinity)
